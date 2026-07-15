@@ -70,7 +70,7 @@ public class MCMCSampler {
             }
 
             // Adaptive step size (dual averaging like Stan)
-            double stepSize = 0.1;
+            double stepSize = findReasonableStepSize(current, currentLogPost, logPostFn);
             double targetAcceptRate = 0.8; // Stan's default for NUTS
 
             List<double[]> chainSamples = new ArrayList<>();
@@ -110,8 +110,8 @@ public class MCMCSampler {
                     chainSamples.add(VecOps.copy(current));
                 }
 
-                // Adapt step size during warmup
-                if (!useNUTS && iter < numWarmup && iter > 0 && iter % 50 == 0) {
+                // Adapt step size during warmup (every 10 iterations for MH)
+                if (!useNUTS && iter < numWarmup && iter > 0 && iter % 10 == 0) {
                     double acceptRate = (double) accepted / (iter + 1);
                     stepSize = adaptStepSize(stepSize, acceptRate, targetAcceptRate, iter);
                 }
@@ -160,7 +160,7 @@ public class MCMCSampler {
         for (int i = 0; i < n; i++) p[i] += 0.5 * eps * gradQ[i];
 
         // Full steps
-        int numSteps = Math.min(1 << maxDepth, 4); // cap at 4 leapfrog steps for performance
+        int numSteps = Math.min(1 << maxDepth, 4); // cap at 4 leapfrog steps
         double bestLogPost = currentLogPost;
         double[] bestParams = VecOps.copy(current);
         double sumAcceptProb = 0;
@@ -228,11 +228,16 @@ public class MCMCSampler {
      */
     private double adaptStepSize(double currentStep, double acceptRate,
                                   double targetAccept, int iteration) {
-        // Simple heuristic: increase if too high acceptance, decrease if too low
-        double ratio = acceptRate / targetAccept;
-        if (ratio > 1.2) return currentStep * 1.1;
-        if (ratio < 0.8) return currentStep * 0.9;
-        return currentStep;
+        // Dual-averaging inspired: use log-space updates for stability
+        // During warmup, adapt more aggressively; later, gentle adjustments
+        double logStep = Math.log(currentStep);
+        double logTarget = Math.log(targetAccept);
+        double logAccept = Math.log(Math.max(acceptRate, 1e-10));
+        double eta = iteration < numWarmup / 2 ? 0.3 : 0.1; // learning rate
+        logStep += eta * (logAccept - logTarget);
+        double newStep = Math.exp(logStep);
+        // Clamp step size to reasonable range
+        return Math.max(1e-6, Math.min(newStep, 10.0));
     }
 
     private static class NUTSResult {
@@ -245,5 +250,55 @@ public class MCMCSampler {
             this.logPost = logPost;
             this.acceptRate = acceptRate;
         }
+    }
+
+    /**
+     * Find a reasonable initial step size using the heuristic from NUTS paper (Hoffman & Gelman 2014).
+     * Start with eps=1 and halve/double until acceptance probability crosses 0.5.
+     */
+    private double findReasonableStepSize(double[] current, double currentLogPost, LogPosteriorFn logPostFn) {
+        double eps = 1.0;
+        double[] momentum = new double[current.length];
+        for (int i = 0; i < current.length; i++) momentum[i] = rng.nextGaussian();
+
+        // One leapfrog step
+        double[] q = VecOps.copy(current);
+        double[] p = VecOps.copy(momentum);
+        double[] gradQ = numericalGradient(q, logPostFn);
+        for (int i = 0; i < current.length; i++) p[i] += 0.5 * eps * gradQ[i];
+        for (int i = 0; i < current.length; i++) q[i] += eps * p[i];
+        gradQ = numericalGradient(q, logPostFn);
+        for (int i = 0; i < current.length; i++) p[i] += 0.5 * eps * gradQ[i];
+
+        double qLogPost = logPostFn.evaluate(q);
+        if (Double.isNaN(qLogPost) || Double.isInfinite(qLogPost)) qLogPost = -1e20;
+
+        double currentKinetic = 0.5 * VecOps.dot(momentum, momentum);
+        double qKinetic = 0.5 * VecOps.dot(p, p);
+        double logAcceptProb = (qLogPost - qKinetic) - (currentLogPost - currentKinetic);
+
+        // Determine direction: if acceptProb > 0.5, increase eps; otherwise decrease
+        double direction = logAcceptProb > Math.log(0.5) ? 1.0 : -1.0;
+
+        for (int i = 0; i < 10; i++) {
+            eps *= Math.pow(2.0, direction);
+            q = VecOps.copy(current);
+            p = VecOps.copy(momentum);
+            gradQ = numericalGradient(q, logPostFn);
+            for (int j = 0; j < current.length; j++) p[j] += 0.5 * eps * gradQ[j];
+            for (int j = 0; j < current.length; j++) q[j] += eps * p[j];
+            gradQ = numericalGradient(q, logPostFn);
+            for (int j = 0; j < current.length; j++) p[j] += 0.5 * eps * gradQ[j];
+
+            qLogPost = logPostFn.evaluate(q);
+            if (Double.isNaN(qLogPost) || Double.isInfinite(qLogPost)) { eps *= 0.5; break; }
+            qKinetic = 0.5 * VecOps.dot(p, p);
+            logAcceptProb = (qLogPost - qKinetic) - (currentLogPost - currentKinetic);
+
+            if (direction > 0 && logAcceptProb < Math.log(0.5)) break;
+            if (direction < 0 && logAcceptProb > Math.log(0.5)) break;
+        }
+
+        return Math.max(eps, 1e-6);
     }
 }

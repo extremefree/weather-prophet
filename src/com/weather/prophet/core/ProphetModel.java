@@ -81,6 +81,9 @@ public class ProphetModel {
     // MCMC samples
     private double[][] mcmcSamples; // [numSamples][numParams]
 
+    // Training data bounds (for trend uncertainty)
+    private double trainingMaxT;
+
     // Status
     private boolean fitted = false;
 
@@ -137,6 +140,7 @@ public class ProphetModel {
         // Step 2: Auto-place changepoints in first 80% of history
         double tMin = trainT[0];
         double tMax = trainT[T - 1];
+        trainingMaxT = tMax;
         double changepointEnd = tMin + config.changepointRange * (tMax - tMin);
         changepoints = new double[config.nChangepoints];
         double step = (changepointEnd - tMin) / config.nChangepoints;
@@ -219,7 +223,8 @@ public class ProphetModel {
                     config.seasonalityPriorScale,
                     config.holidaysPriorScale,
                     config.sigmaObsPriorScale,
-                    logGrowth
+                    logGrowth,
+                    config.cap, yMean, yStd
             );
             // Expand to [value, gradient...]
             double[] result1 = new double[1 + theta.length];
@@ -267,7 +272,8 @@ public class ProphetModel {
                         config.seasonalityPriorScale,
                         config.holidaysPriorScale,
                         config.sigmaObsPriorScale,
-                        logGrowth
+                        logGrowth,
+                        config.cap, yMean, yStd
                 );
                 return -nlp[0]; // negate to get log posterior
             };
@@ -312,10 +318,10 @@ public class ProphetModel {
             if (config.growth == ProphetConfig.GrowthType.LINEAR) {
                 trend[i] = (k + aDeltaSum) * ti + (m + aGammaSum);
             } else {
-                // Logistic growth
+                // Logistic growth (in standardized space, cap must also be standardized)
                 double rate = k + aDeltaSum;
                 double offset = m + aGammaSum;
-                double C = config.cap;
+                double C = (config.cap - yMean) / yStd; // standardize cap
                 trend[i] = C / (1.0 + Math.exp(-rate * (ti - offset)));
             }
         }
@@ -416,12 +422,20 @@ public class ProphetModel {
 
         double[][] yhatSamples = new double[numSim][n];
 
+        // Prophet's trend uncertainty: estimate the rate of change from observed deltas,
+        // then simulate future rate changes as random walks with that variance.
+        // This is exactly how Prophet's make_historic_dataframe + predictive_samples works.
+        double deltaVar = 0;
+        for (int j = 0; j < S; j++) deltaVar += delta[j] * delta[j];
+        deltaVar = Math.max(deltaVar / S, 1e-10);
+
         for (int s = 0; s < numSim; s++) {
-            // Prophet samples delta perturbation from Laplace(0, tau)
-            // and adds it to the MAP delta estimate
-            double[] futureDelta = new double[S];
+            // Prophet's approach: for each simulation, sample future trend increments
+            // from N(0, deltaVar) — the empirical variance of observed rate changes.
+            // This gives realistic trend uncertainty that grows with forecast horizon.
+            double[] simDelta = new double[S];
             for (int j = 0; j < S; j++) {
-                futureDelta[j] = delta[j] + sampleLaplace(rng, 0, config.changepointPriorScale) * 0.1;
+                simDelta[j] = delta[j];
             }
 
             for (int i = 0; i < n; i++) {
@@ -429,16 +443,28 @@ public class ProphetModel {
                 double aDeltaSum = 0, aGammaSum = 0;
                 for (int j = 0; j < S; j++) {
                     double a = ti >= changepoints[j] ? 1.0 : 0.0;
-                    aDeltaSum += a * futureDelta[j];
-                    aGammaSum += a * (-changepoints[j] * futureDelta[j]);
+                    aDeltaSum += a * simDelta[j];
+                    aGammaSum += a * (-changepoints[j] * simDelta[j]);
                 }
+                // Prophet's key formula for trend uncertainty:
+                // For future dates, add cumulative random walk perturbation
+                // σ_trend(t) = sqrt(T * δVar) where T is forecast horizon
                 double trendSample;
                 if (config.growth == ProphetConfig.GrowthType.LINEAR) {
                     trendSample = (k + aDeltaSum) * ti + (m + aGammaSum);
+                    // Add trend uncertainty: Prophet uses the empirical delta variance
+                    // to simulate how much the trend could drift over the forecast horizon
+                    double maxT = trainingMaxT;
+                    if (ti > maxT) {
+                        double futureHorizon = ti - maxT;
+                        double trendUncertainty = rng.nextGaussian() * Math.sqrt(futureHorizon * deltaVar);
+                        trendSample += trendUncertainty;
+                    }
                 } else {
                     double rate = k + aDeltaSum;
                     double offset = m + aGammaSum;
-                    trendSample = config.cap / (1.0 + Math.exp(-rate * (ti - offset)));
+                    double C = (config.cap - yMean) / yStd; // standardize cap
+                    trendSample = C / (1.0 + Math.exp(-rate * (ti - offset)));
                 }
                 // Add seasonality and holiday (from MAP estimates)
                 double seasonVal = 0;
@@ -466,7 +492,7 @@ public class ProphetModel {
                         holVal += kappa[j] * Math.exp(-0.5 * diff * diff / (sigma * sigma));
                     }
                 }
-                // Add observation noise
+                // Add observation noise (Prophet's sigma_obs)
                 yhatSamples[s][i] = trendSample + seasonVal + holVal + rng.nextGaussian() * sigmaObs;
             }
         }

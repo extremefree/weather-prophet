@@ -46,9 +46,9 @@ public class BayesianPriors {
         return 0.0; // sub-gradient at 0
     }
 
-    /** Half-Cauchy log PDF: log HC(x | 0, scale) for x > 0 */
+    /** Half-Cauchy log PDF: log HC(x | 0, scale) for x >= 0 */
     public static double logHalfCauchy(double x, double scale) {
-        if (x <= 0) return Double.NEGATIVE_INFINITY;
+        if (x < 0) return Double.NEGATIVE_INFINITY;
         return Math.log(2.0 / Math.PI) - Math.log(scale) - Math.log(1 + (x * x) / (scale * scale));
     }
 
@@ -90,7 +90,10 @@ public class BayesianPriors {
             double sigmaBeta,      // Normal scale for beta (seasonality_prior_scale)
             double sigmaKappa,     // Normal scale for kappa (holidays_prior_scale
             double sigmaObsScale,  // Half-Cauchy scale for sigma_obs
-            boolean logisticGrowth // whether using logistic growth
+            boolean logisticGrowth, // whether using logistic growth
+            double cap,            // carrying capacity for logistic growth (in original scale)
+            double yMean,          // y mean for standardization
+            double yStd            // y std for standardization
     ) {
         int T = t.length;
         int S = changepoints.length;
@@ -129,8 +132,7 @@ public class BayesianPriors {
                 trend[i] = (k + aDeltaSum) * ti + (m + aGammaSum);
             } else {
                 // Logistic: g(t) = C / (1 + exp(-(k + A*d) * (t - (m + A*gamma))))
-                // For weather, C = carrying capacity (e.g., max plausible temp)
-                double C = 60.0; // 60°C as upper bound
+                double C = (cap - yMean) / yStd; // standardized cap
                 double r = (k + aDeltaSum);
                 double offset = (m + aGammaSum);
                 trend[i] = C / (1.0 + Math.exp(-r * (ti - offset)));
@@ -197,7 +199,7 @@ public class BayesianPriors {
                 // Logistic gradient
                 double expTerm = Math.exp(-rateAtT[i] * (ti - (m)));
                 double denom = (1 + expTerm) * (1 + expTerm);
-                double C = 60.0;
+                double C = (cap - yMean) / yStd;
                 dLdk += dLdYhat[i] * C * expTerm * ti / denom; // approximate
             }
         }
