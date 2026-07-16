@@ -10,7 +10,7 @@ import java.util.List;
 public class ProphetConfig {
 
     public enum GrowthType { LINEAR, LOGISTIC, FLAT }
-    public enum SeasonalityMode { ADDITIVE, MULTIPLICATIVE }
+    public enum SeasonalityMode { ADDITIVE, MULTIPLICATIVE, MIXED }
     public enum Scaling { ABSMAX, MINMAX }
 
     // Growth

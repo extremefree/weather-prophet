@@ -199,18 +199,23 @@ public class ProphetModel {
 
     private void buildSeasonalFeatures(int T) {
         // Reference: forecaster.py fourier_series + make_all_seasonality_features
+        // For MIXED mode: generate standard Fourier + time-weighted Fourier features
+        // Time-weighted features: t_scaled * sin/cos — amplitude grows with time
+        // This captures patterns where seasonal amplitude increases over time
         List<double[]> featureList = new ArrayList<>();
         List<Double> sigmaList = new ArrayList<>();
+
+        boolean isMixed = config.seasonalityMode == ProphetConfig.SeasonalityMode.MIXED;
 
         if (config.yearlySeasonality) {
             int order = config.yearlyFourierOrder;
             double period = config.yearlyPeriod;
+            // Standard Fourier features (constant amplitude)
             for (int k = 1; k <= order; k++) {
                 double[] sinCol = new double[T];
                 double[] cosCol = new double[T];
                 double arg = 2 * Math.PI * k / period;
                 for (int i = 0; i < T; i++) {
-                    // Time in original units (days), not scaled
                     double days = trainT[i] * tScale + tMin;
                     sinCol[i] = Math.sin(days * arg);
                     cosCol[i] = Math.cos(days * arg);
@@ -219,6 +224,23 @@ public class ProphetModel {
                 featureList.add(cosCol);
                 sigmaList.add(config.yearlySeasonalityPriorScale);
                 sigmaList.add(config.yearlySeasonalityPriorScale);
+            }
+            // Time-weighted Fourier features (growing amplitude) — MIXED mode only
+            if (isMixed) {
+                for (int k = 1; k <= order; k++) {
+                    double[] sinCol = new double[T];
+                    double[] cosCol = new double[T];
+                    double arg = 2 * Math.PI * k / period;
+                    for (int i = 0; i < T; i++) {
+                        double days = trainT[i] * tScale + tMin;
+                        sinCol[i] = trainT[i] * Math.sin(days * arg);  // t_scaled * sin
+                        cosCol[i] = trainT[i] * Math.cos(days * arg);  // t_scaled * cos
+                    }
+                    featureList.add(sinCol);
+                    featureList.add(cosCol);
+                    sigmaList.add(config.yearlySeasonalityPriorScale);
+                    sigmaList.add(config.yearlySeasonalityPriorScale);
+                }
             }
         }
 
@@ -239,6 +261,22 @@ public class ProphetModel {
                 sigmaList.add(config.weeklySeasonalityPriorScale);
                 sigmaList.add(config.weeklySeasonalityPriorScale);
             }
+            if (isMixed) {
+                for (int k = 1; k <= order; k++) {
+                    double[] sinCol = new double[T];
+                    double[] cosCol = new double[T];
+                    double arg = 2 * Math.PI * k / period;
+                    for (int i = 0; i < T; i++) {
+                        double days = trainT[i] * tScale + tMin;
+                        sinCol[i] = trainT[i] * Math.sin(days * arg);
+                        cosCol[i] = trainT[i] * Math.cos(days * arg);
+                    }
+                    featureList.add(sinCol);
+                    featureList.add(cosCol);
+                    sigmaList.add(config.weeklySeasonalityPriorScale);
+                    sigmaList.add(config.weeklySeasonalityPriorScale);
+                }
+            }
         }
 
         if (config.dailySeasonality) {
@@ -257,6 +295,22 @@ public class ProphetModel {
                 featureList.add(cosCol);
                 sigmaList.add(config.dailySeasonalityPriorScale);
                 sigmaList.add(config.dailySeasonalityPriorScale);
+            }
+            if (isMixed) {
+                for (int k = 1; k <= order; k++) {
+                    double[] sinCol = new double[T];
+                    double[] cosCol = new double[T];
+                    double arg = 2 * Math.PI * k / period;
+                    for (int i = 0; i < T; i++) {
+                        double days = trainT[i] * tScale + tMin;
+                        sinCol[i] = trainT[i] * Math.sin(days * arg);
+                        cosCol[i] = trainT[i] * Math.cos(days * arg);
+                    }
+                    featureList.add(sinCol);
+                    featureList.add(cosCol);
+                    sigmaList.add(config.dailySeasonalityPriorScale);
+                    sigmaList.add(config.dailySeasonalityPriorScale);
+                }
             }
         }
 
@@ -346,7 +400,13 @@ public class ProphetModel {
         s_m = new double[K];
 
         boolean isAdditive = config.seasonalityMode == ProphetConfig.SeasonalityMode.ADDITIVE;
+        boolean isMultiplicative = config.seasonalityMode == ProphetConfig.SeasonalityMode.MULTIPLICATIVE;
+        boolean isMixed = config.seasonalityMode == ProphetConfig.SeasonalityMode.MIXED;
         boolean holidaysAdditive = config.getHolidaysMode() == ProphetConfig.SeasonalityMode.ADDITIVE;
+
+        // For MIXED mode: ALL features are additive (s_a=1).
+        // Standard Fourier + time-weighted Fourier both contribute directly.
+        // Time-weighted features (t_scaled * sin/cos) naturally have growing amplitude.
 
         for (int i = 0; i < T; i++) {
             int col = 0;
@@ -354,8 +414,11 @@ public class ProphetModel {
             for (int j = 0; j < Ks; j++) {
                 X[i][col] = XSeasonal[i][j];
                 sigmas[col] = seasonalSigmas[j];
-                s_a[col] = isAdditive ? 1.0 : 0.0;
-                s_m[col] = isAdditive ? 0.0 : 1.0;
+                if (isAdditive || isMixed) {
+                    s_a[col] = 1.0; s_m[col] = 0.0;
+                } else { // MULTIPLICATIVE
+                    s_a[col] = 0.0; s_m[col] = 1.0;
+                }
                 col++;
             }
             // Holiday features
@@ -883,22 +946,33 @@ public class ProphetModel {
         if (X == null) return null;
 
         int K = X[0].length;
-        int Ks = XSeasonal != null ? XSeasonal[0].length : 0;
-        int Kh = XHoliday != null ? XHoliday[0].length : 0;
         double[][] XFuture = new double[N][K];
+
+        boolean isMixed = config.seasonalityMode == ProphetConfig.SeasonalityMode.MIXED;
 
         for (int i = 0; i < N; i++) {
             double days = futureT[i];
+            // Compute scaled time for MIXED mode's time-weighted features
+            double tScaled = (days - tMin) / tScale;
             int col = 0;
 
-            // Seasonal features
+            // Seasonal features (same structure as buildSeasonalFeatures)
             if (config.yearlySeasonality) {
                 int order = config.yearlyFourierOrder;
                 double period = config.yearlyPeriod;
+                // Standard yearly features
                 for (int k = 1; k <= order; k++) {
                     double arg = 2 * Math.PI * k / period;
                     XFuture[i][col++] = Math.sin(days * arg);
                     XFuture[i][col++] = Math.cos(days * arg);
+                }
+                // Time-weighted yearly features (MIXED mode only)
+                if (isMixed) {
+                    for (int k = 1; k <= order; k++) {
+                        double arg = 2 * Math.PI * k / period;
+                        XFuture[i][col++] = tScaled * Math.sin(days * arg);
+                        XFuture[i][col++] = tScaled * Math.cos(days * arg);
+                    }
                 }
             }
             if (config.weeklySeasonality) {
@@ -909,6 +983,13 @@ public class ProphetModel {
                     XFuture[i][col++] = Math.sin(days * arg);
                     XFuture[i][col++] = Math.cos(days * arg);
                 }
+                if (isMixed) {
+                    for (int k = 1; k <= order; k++) {
+                        double arg = 2 * Math.PI * k / period;
+                        XFuture[i][col++] = tScaled * Math.sin(days * arg);
+                        XFuture[i][col++] = tScaled * Math.cos(days * arg);
+                    }
+                }
             }
             if (config.dailySeasonality) {
                 int order = config.dailyFourierOrder;
@@ -917,6 +998,13 @@ public class ProphetModel {
                     double arg = 2 * Math.PI * k / period;
                     XFuture[i][col++] = Math.sin(days * arg);
                     XFuture[i][col++] = Math.cos(days * arg);
+                }
+                if (isMixed) {
+                    for (int k = 1; k <= order; k++) {
+                        double arg = 2 * Math.PI * k / period;
+                        XFuture[i][col++] = tScaled * Math.sin(days * arg);
+                        XFuture[i][col++] = tScaled * Math.cos(days * arg);
+                    }
                 }
             }
 

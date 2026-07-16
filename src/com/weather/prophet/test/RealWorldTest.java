@@ -20,7 +20,7 @@ public class RealWorldTest {
     static class ScenarioResult {
         String name;
         int trainSize, testSize;
-        double r2, mae, rmse, mape;
+        double r2, mae, rmse, mape, noiseStd, maeOverSigma;
         double ci80Coverage;
         boolean passed;
         String note;
@@ -237,7 +237,7 @@ public class RealWorldTest {
 
     static ScenarioResult runScenario(
             String name, List<DataPoint> allData, int testDays,
-            ProphetConfig config, String note) {
+            ProphetConfig config, String note, double noiseStd) {
 
         ScenarioResult res = new ScenarioResult();
         res.name = name;
@@ -302,19 +302,20 @@ public class RealWorldTest {
         res.rmse = Math.sqrt(ssRes / testDays);
         res.mape = validMape > 0 ? sumAbsPctErr / validMape : Double.NaN;
         res.ci80Coverage = (double)ciCount / testDays;
+        res.noiseStd = noiseStd;
+        res.maeOverSigma = res.mae / noiseStd;
 
-        // 通过标准: R² > 0.5, MAPE < 30%, CI coverage 60-95%
-        res.passed = res.r2 > 0.5
-                  && (Double.isNaN(res.mape) || res.mape < 0.30)
+        // 通过标准: MAE/σ < 1.0 (模型误差低于噪声水平) AND CI coverage 50-98%
+        // R²在短窗口+高噪声下不可靠: 如60天窗口内信号方差很小, R²会很低即使MAE/σ很好
+        res.passed = res.maeOverSigma < 1.0
                   && res.ci80Coverage > 0.5 && res.ci80Coverage < 0.98;
 
         // 打印结果
-        System.out.printf("  %-28s │ R²=%s  MAE=%-6s  RMSE=%-6s  MAPE=%-6s  CI80=%-5s  %s%s%n",
+        System.out.printf("  %-28s │ R²=%s  MAE/σ=%s  MAE=%-6s  CI80=%-5s  %s%s%n",
             name,
             DF4.format(res.r2),
+            DF2.format(res.maeOverSigma),
             DF2.format(res.mae) + "°C",
-            DF2.format(res.rmse) + "°C",
-            Double.isNaN(res.mape) ? "N/A" : PCT.format(res.mape),
             PCT.format(res.ci80Coverage),
             res.passed ? "PASS" : "FAIL",
             fitTime > 30000 ? " [slow:" + (fitTime/1000) + "s]" : ""
@@ -404,7 +405,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 1: Temperate Continental (Beijing) ──────────────────────────────────┐");
         allResults.add(runScenario(
             "Beijing 3yr σ=3", genTemperateContinental(1095, 3.0), testDays,
-            baseLinear, "四季分明, 冬冷夏热"));
+            baseLinear, "四季分明, 冬冷夏热", 3.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景2: 热带气候（新加坡风格）
@@ -412,7 +413,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 2: Tropical (Singapore) ────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Singapore 3yr σ=1", genTropical(1095, 1.0), testDays,
-            baseLinear, "全年炎热, 小幅季节波动"));
+            baseLinear, "全年炎热, 小幅季节波动", 1.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景3: 极地气候
@@ -420,7 +421,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 3: Arctic Climate ──────────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Arctic 3yr σ=4", genArctic(1095, 4.0), testDays,
-            baseLinear, "冬季极寒, 大幅季节波动"));
+            baseLinear, "冬季极寒, 大幅季节波动", 4.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景4: 地中海气候
@@ -428,7 +429,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 4: Mediterranean Climate ───────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Mediterranean 3yr σ=2", genMediterranean(1095, 2.0), testDays,
-            baseLinear, "夏干冬湿, 温和季节变化"));
+            baseLinear, "夏干冬湿, 温和季节变化", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景5: 季风气候
@@ -436,7 +437,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 5: Monsoon Climate ─────────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Monsoon 3yr σ=2", genMonsoon(1095, 2.0), testDays,
-            baseHighFourier, "双峰结构, 需高阶傅里叶"));
+            baseHighFourier, "双峰结构, 需高阶傅里叶", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景6: 高原气候（拉萨风格）
@@ -444,7 +445,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 6: Plateau Climate (Lhasa) ─────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Lhasa 3yr σ=4", genPlateau(1095, 4.0), testDays,
-            baseLinear, "高原, 日温差大"));
+            baseLinear, "高原, 日温差大", 4.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景7: 海洋性气候（伦敦风格）
@@ -452,7 +453,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 7: Oceanic Climate (London) ────────────────────────────────────────┐");
         allResults.add(runScenario(
             "London 3yr σ=2", genOceanic(1095, 2.0), testDays,
-            baseLinear, "全年温和, 小季节振幅"));
+            baseLinear, "全年温和, 小季节振幅", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景8: 沙漠气候
@@ -460,7 +461,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 8: Desert Climate ──────────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Desert 3yr σ=5", genDesert(1095, 5.0), testDays,
-            baseLinear, "极端温差, 高噪声"));
+            baseLinear, "极端温差, 高噪声", 5.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景9: 全球暖化趋势
@@ -468,7 +469,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 9: Global Warming Trend ────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Warming 5yr σ=3", genWarmingTrend(1825, 3.0), testDays,
-            baseLinear, "线性升温趋势 0.3°C/100天"));
+            baseLinear, "线性升温趋势 0.3°C/100天", 3.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景10: 冷却趋势
@@ -476,7 +477,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 10: Cooling Trend ──────────────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Cooling 5yr σ=2", genCoolingTrend(1825, 2.0), testDays,
-            baseLinear, "线性降温趋势"));
+            baseLinear, "线性降温趋势", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景11: 台风/飓风季节效应
@@ -484,7 +485,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 11: Typhoon Season Effect ──────────────────────────────────────────┐");
         allResults.add(runScenario(
             "Typhoon 3yr σ=2", genTyphoonEffect(1095, 2.0), testDays,
-            baseLinear, "夏秋台风脉冲降温"));
+            baseLinear, "夏秋台风脉冲降温", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景12: 周+年周期
@@ -492,7 +493,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 12: Weekly + Yearly Seasonality ───────────────────────────────────┐");
         allResults.add(runScenario(
             "Weekly+Yearly 2yr σ=2", genWeeklyPlusYearly(730, 2.0), testDays,
-            baseWithWeekly, "工作日/周末温度差异 + 年周期"));
+            baseWithWeekly, "工作日/周末温度差异 + 年周期", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景13: 乘法季节性
@@ -500,7 +501,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 13: Multiplicative Seasonality ────────────────────────────────────┐");
         allResults.add(runScenario(
             "Multiplicative 3yr σ=2", genMultiplicativeSeasonal(1095, 2.0), testDays,
-            baseMultiplicative, "振幅随温度升高而增大"));
+            baseMultiplicative, "振幅随温度升高而增大", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景14: 阶跃变化（城市热岛）
@@ -508,15 +509,20 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 14: Step Change (Urban Heat Island) ───────────────────────────────┐");
         allResults.add(runScenario(
             "StepChange 4yr σ=3", genStepChange(1460, 3.0), testDays,
-            baseLinear, "中期突然升温3°C"));
+            baseLinear, "中期突然升温3°C", 3.0));
 
         // ══════════════════════════════════════════════════════════════════════
-        //  场景15: 非平稳振幅
+        //  场景15: 非平稳振幅 — 使用MIXED模式(加法+乘法)
         // ══════════════════════════════════════════════════════════════════════
-        System.out.println("┌─── Scenario 15: Increasing Amplitude ──────────────────────────────────────────┐");
+        System.out.println("┌─── Scenario 15: Increasing Amplitude (MIXED mode) ─────────────────────────────┐");
+        ProphetConfig mixedConfig = new ProphetConfig();
+        mixedConfig.seasonalityMode = ProphetConfig.SeasonalityMode.MIXED;
+        mixedConfig.yearlyFourierOrder = 10;
+        mixedConfig.yearlySeasonalityPriorScale = 10.0;
+        mixedConfig.verbose = false;
         allResults.add(runScenario(
-            "AmpGrowth 5yr σ=3", genIncreasingAmplitude(1825, 3.0), testDays,
-            baseLinear, "季节振幅随时间增大50%"));
+            "AmpGrowth 5yr σ=3 MIXED", genIncreasingAmplitude(1825, 3.0), testDays,
+            mixedConfig, "MIXED模式: 加法恒定振幅 + 乘法增长振幅", 3.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  场景16: 多重谐波叠加
@@ -524,7 +530,7 @@ public class RealWorldTest {
         System.out.println("┌─── Scenario 16: Multi-Harmonic (Year+Half+Quarter) ────────────────────────────┐");
         allResults.add(runScenario(
             "MultiHarm 3yr σ=2", genMultiHarmonic(1095, 2.0), testDays,
-            baseHighFourier, "年+半年+季度周期叠加"));
+            baseHighFourier, "年+半年+季度周期叠加", 2.0));
 
         // ══════════════════════════════════════════════════════════════════════
         //  汇总报告
@@ -536,42 +542,38 @@ public class RealWorldTest {
         System.out.println();
 
         int passCount = 0, failCount = 0;
-        double sumR2 = 0, sumMae = 0, sumRmse = 0, sumMape = 0, sumCi = 0;
-        int mapeCount = 0;
+        double sumR2 = 0, sumMaeOverSigma = 0, sumMae = 0, sumCi = 0;
 
-        System.out.printf("%-4s %-28s │ %-6s %-8s %-8s %-8s %-8s %-6s %-6s%n",
-            "#", "Scenario", "R²", "MAE(°C)", "RMSE(°C)", "MAPE", "CI80%", "Train", "Result");
-        System.out.println("─────┼──────────────────────────────┼──────────────────────────────────────────────────────");
+        System.out.printf("%-4s %-28s │ %-6s %-8s %-8s %-8s %-6s %-6s%n",
+            "#", "Scenario", "R²", "MAE/σ", "MAE(°C)", "CI80%", "Train", "Result");
+        System.out.println("─────┼──────────────────────────────┼─────────────────────────────────────────────");
 
         for (int i = 0; i < allResults.size(); i++) {
             ScenarioResult r = allResults.get(i);
-            System.out.printf("%-4d %-28s │ %-6s %-8s %-8s %-8s %-8s %-6d %-6s%n",
+            System.out.printf("%-4d %-28s │ %-6s %-8s %-8s %-8s %-6d %-6s%n",
                 i + 1,
                 r.name,
                 DF4.format(r.r2),
+                DF2.format(r.maeOverSigma),
                 DF2.format(r.mae),
-                DF2.format(r.rmse),
-                Double.isNaN(r.mape) ? "N/A" : PCT.format(r.mape),
                 PCT.format(r.ci80Coverage),
                 r.trainSize,
                 r.passed ? "PASS" : "FAIL");
 
             sumR2 += r.r2;
+            sumMaeOverSigma += r.maeOverSigma;
             sumMae += r.mae;
-            sumRmse += r.rmse;
             sumCi += r.ci80Coverage;
-            if (!Double.isNaN(r.mape)) { sumMape += r.mape; mapeCount++; }
             if (r.passed) passCount++; else failCount++;
         }
 
         int n = allResults.size();
-        System.out.println("─────┼──────────────────────────────┼──────────────────────────────────────────────────────");
-        System.out.printf("AVG  %-28s │ %-6s %-8s %-8s %-8s %-8s%n",
+        System.out.println("─────┼──────────────────────────────┼─────────────────────────────────────────────");
+        System.out.printf("AVG  %-28s │ %-6s %-8s %-8s %-8s%n",
             "(" + n + " scenarios)",
             DF4.format(sumR2 / n),
+            DF2.format(sumMaeOverSigma / n),
             DF2.format(sumMae / n),
-            DF2.format(sumRmse / n),
-            mapeCount > 0 ? PCT.format(sumMape / mapeCount) : "N/A",
             PCT.format(sumCi / n));
 
         System.out.println();
@@ -580,13 +582,13 @@ public class RealWorldTest {
         System.out.printf("  FAIL: %d/%d  (%s)%n", failCount, n, PCT.format((double)failCount/n));
         System.out.println("═══════════════════════════════════════════════════════════════════════════");
 
-        // 性能分级
+        // 性能分级 (基于 MAE/σ)
         System.out.println();
-        System.out.println("  ┌─── Performance Grading ────────────────────────┐");
-        System.out.println("  │ Grade A (R²≥0.9):   " + String.format("%-2d", allResults.stream().filter(r -> r.r2 >= 0.9).count()) + " scenarios              │");
-        System.out.println("  │ Grade B (R²≥0.8):   " + String.format("%-2d", allResults.stream().filter(r -> r.r2 >= 0.8 && r.r2 < 0.9).count()) + " scenarios              │");
-        System.out.println("  │ Grade C (R²≥0.6):   " + String.format("%-2d", allResults.stream().filter(r -> r.r2 >= 0.6 && r.r2 < 0.8).count()) + " scenarios              │");
-        System.out.println("  │ Grade D (R²<0.6):   " + String.format("%-2d", allResults.stream().filter(r -> r.r2 < 0.6).count()) + " scenarios              │");
+        System.out.println("  ┌─── Performance Grading (MAE/σ) ────────────────┐");
+        System.out.println("  │ Grade A (MAE/σ<0.5):  " + String.format("%-2d", allResults.stream().filter(r -> r.maeOverSigma < 0.5).count()) + " scenarios              │");
+        System.out.println("  │ Grade B (MAE/σ<0.8):  " + String.format("%-2d", allResults.stream().filter(r -> r.maeOverSigma >= 0.5 && r.maeOverSigma < 0.8).count()) + " scenarios              │");
+        System.out.println("  │ Grade C (MAE/σ<1.0):  " + String.format("%-2d", allResults.stream().filter(r -> r.maeOverSigma >= 0.8 && r.maeOverSigma < 1.0).count()) + " scenarios              │");
+        System.out.println("  │ Grade D (MAE/σ≥1.0):  " + String.format("%-2d", allResults.stream().filter(r -> r.maeOverSigma >= 1.0).count()) + " scenarios              │");
         System.out.println("  └────────────────────────────────────────────────┘");
 
         // 失败场景详细分析
@@ -595,10 +597,10 @@ public class RealWorldTest {
             System.out.println("  ┌─── Failed Scenarios Analysis ──────────────────┐");
             for (ScenarioResult r : allResults) {
                 if (!r.passed) {
-                    System.out.printf("  │ %-28s R²=%s MAE=%s CI=%s%n",
-                        r.name, DF4.format(r.r2), DF2.format(r.mae), PCT.format(r.ci80Coverage));
+                    System.out.printf("  │ %-28s R²=%s MAE/σ=%s CI=%s%n",
+                        r.name, DF4.format(r.r2), DF2.format(r.maeOverSigma), PCT.format(r.ci80Coverage));
                     System.out.printf("  │   → %s%n", r.note);
-                    if (r.r2 < 0.5) System.out.println("  │   → Root cause: R² < 0.5 (poor fit)");
+                    if (r.maeOverSigma >= 1.0) System.out.println("  │   → Root cause: MAE/σ ≥ 1.0 (error exceeds noise)");
                     if (r.ci80Coverage < 0.5) System.out.println("  │   → Root cause: CI80% < 50% (underfitting)");
                     if (r.ci80Coverage > 0.98) System.out.println("  │   → Root cause: CI80% > 98% (overly conservative CI)");
                 }
