@@ -1026,10 +1026,33 @@ public class ProphetModel {
 
     // ===================== Getters =====================
 
+    public ProphetConfig getConfig() { return config; }
     public double getSigmaObs() { return sigmaObs * yScale; }  // back to original scale
+    public double getSigmaObsRaw() { return sigmaObs; }        // scaled
     public double[] getDelta() { return delta; }
     public double[] getBeta() { return beta; }
     public double getK() { return k; }
     public double getM() { return m; }
+    public double getYScale() { return yScale; }
+    public double getYOffset() { return yOffset; }
+    public double getTMin() { return tMin; }
+    public double getTScale() { return tScale; }
+    public double getTrainingMaxT() { return trainingMaxT; }
+    public int getGrowthCode() { return growthCode; }
+    public double[] getChangepoints() { return changepoints; }
+    public double[] getSA() { return s_a; }
+    public double[] getSM() { return s_m; }
+    public double[] getSigmas() { return sigmas; }
+    public double[] getCapScaled() { return capScaled; }
+    public double[] getTrainT() { return trainT; }
+    public double[] getTrainY() { return trainY; }
     public List<double[]> getPosteriorSamples() { return posteriorSamples; }
+
+    // ===================== Setters (for deserialization) =====================
+
+    public void setK(double k) { this.k = k; }
+    public void setM(double m) { this.m = m; }
+    public void setSigmaObs(double s) { this.sigmaObs = s; }
+    public void setDelta(double[] d) { this.delta = d; }
+    public void setBeta(double[] b) { this.beta = b; }
 }
