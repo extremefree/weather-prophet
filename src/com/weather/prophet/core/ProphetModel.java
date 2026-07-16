@@ -38,6 +38,10 @@ public class ProphetModel {
     private double[][] XSeasonal;  // Fourier features
     private double[][] XHoliday;   // Holiday features
     private double[][] X;          // Combined feature matrix [seasonal | holiday]
+
+    // Getter/setter
+    public double[][] getX() { return X; }
+    public void setX(double[][] v) { this.X = v; }
     private double[] sigmas;        // Per-component prior scales
     private double[] s_a;           // Additive indicator vector
     private double[] s_m;           // Multiplicative indicator vector
@@ -688,7 +692,7 @@ public class ProphetModel {
         }
 
         // Uncertainty estimation
-        if (nUncertaintySamples > 0 && !posteriorSamples.isEmpty()) {
+        if (nUncertaintySamples > 0 && posteriorSamples != null && !posteriorSamples.isEmpty()) {
             computeUncertainty(tScaled, XFuture, futureCapScaled, N, nUncertaintySamples, result);
         } else if (nUncertaintySamples > 0) {
             // No MCMC samples: use MAP estimate with sigma_obs-based intervals
@@ -1055,4 +1059,19 @@ public class ProphetModel {
     public void setSigmaObs(double s) { this.sigmaObs = s; }
     public void setDelta(double[] d) { this.delta = d; }
     public void setBeta(double[] b) { this.beta = b; }
+    public void setYScale(double v) { this.yScale = v; }
+    public void setYOffset(double v) { this.yOffset = v; }
+    public void setTMin(double v) { this.tMin = v; }
+    public void setTScale(double v) { this.tScale = v; }
+    public void setTrainingMaxT(double v) { this.trainingMaxT = v; }
+    public void setGrowthCode(int v) { this.growthCode = v; }
+    public void setChangepoints(double[] v) { this.changepoints = v; }
+    public void setSA(double[] v) { this.s_a = v; }
+    public void setSM(double[] v) { this.s_m = v; }
+    public void setSigmas(double[] v) { this.sigmas = v; }
+    public void setCapScaled(double[] v) { this.capScaled = v; }
+    public void setTrainT(double[] v) { this.trainT = v; }
+    public void setTrainY(double[] v) { this.trainY = v; }
+    public void setPosteriorSamples(java.util.List<double[]> v) { this.posteriorSamples = v; }
+
 }
