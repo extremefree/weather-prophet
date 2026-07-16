@@ -43,15 +43,40 @@ public class BayesianPriors {
         return -(x - mu) / (sigma * sigma);
     }
 
+    /**
+     * Smooth Laplace (L1) prior using Huber-like approximation.
+     * For |x| > epsilon: -|x-mu|/b - log(2b)  (standard Laplace)
+     * For |x| <= epsilon: -x^2/(2*b*epsilon) - log(2b) + log(epsilon/b) + 0.5
+     * This avoids gradient discontinuity at x=0 that causes L-BFGS stalling.
+     */
     public static double logLaplace(double x, double mu, double b) {
-        return -Math.abs(x - mu) / b - Math.log(2 * b);
+        double diff = x - mu;
+        double eps = b * 0.5;  // smoothing radius: half the prior scale (balances smoothness & sparsity)
+        double absDiff = Math.abs(diff);
+        if (absDiff > eps) {
+            return -absDiff / b - Math.log(2 * b);
+        } else {
+            // Quadratic in the small region: -x^2/(2*b*eps) + const
+            // Matching value at boundary: -eps/(2*b*eps) = -0.5/b
+            // Standard Laplace at boundary: -eps/b
+            // Difference: -eps/b + 0.5/b = -(eps-0.5)/b... hmm
+            // Actually use standard Laplace with smooth abs: sqrt(x^2 + eps^2)
+            double smoothAbs = Math.sqrt(diff * diff + eps * eps);
+            // Adjust log to maintain normalization approximately:
+            // logLaplace_smooth = -smoothAbs/b - log(2b) + log(eps/b) approximately
+            return -smoothAbs / b - Math.log(2 * b) + Math.log(eps / b + 1);
+        }
     }
 
+    /**
+     * Gradient of smooth Laplace prior.
+     * d/dx of -sqrt(x^2+eps^2)/b = -x/(b*sqrt(x^2+eps^2))
+     */
     public static double gradLogLaplace(double x, double mu, double b) {
         double diff = x - mu;
-        if (diff > 1e-12) return -1.0 / b;
-        if (diff < -1e-12) return 1.0 / b;
-        return 0.0;
+        double eps = b * 0.01;
+        double smoothAbs = Math.sqrt(diff * diff + eps * eps);
+        return -diff / (b * smoothAbs);
     }
 
     // ===================== Trend Functions =====================

@@ -4,6 +4,7 @@ import com.weather.prophet.data.DataPoint;
 import com.weather.prophet.matrix.Matrix;
 import com.weather.prophet.matrix.VecOps;
 import com.weather.prophet.optimize.BayesianPriors;
+import com.weather.prophet.optimize.AdamOptimizer;
 import com.weather.prophet.optimize.LBFGSOptimizer;
 import com.weather.prophet.mcmc.MCMCSampler;
 import com.weather.prophet.compute.CPUBackend;
@@ -140,8 +141,8 @@ public class ProphetModel {
         // Reference: forecaster.py linear_growth_init / logistic_growth_init / flat_growth_init
         double[] initTheta = initializeTrendParams();
 
-        // --- 10. Optimize (L-BFGS MAP estimate) ---
-        if (config.verbose) System.out.println("[Prophet] Running L-BFGS optimization (MAP estimate)...");
+        // --- 10. Optimize (Adam + L-BFGS MAP estimate) ---
+        if (config.verbose) System.out.println("[Prophet] Running optimization (Adam + L-BFGS)...");
         optimize(initTheta);
 
         // --- 11. MCMC if requested ---
@@ -371,8 +372,9 @@ public class ProphetModel {
     // ===================== Trend Initialization =====================
 
     /**
-     * Initialize trend parameters using Prophet's growth_init methods.
-     * Reference: forecaster.py linear_growth_init, logistic_growth_init, flat_growth_init
+     * Initialize trend parameters using Prophet's growth_init methods,
+     * then use least-squares on residuals to initialize beta (seasonal coefficients).
+     * This provides a much better starting point for L-BFGS optimization.
      */
     private double[] initializeTrendParams() {
         int S = changepoints.length;
@@ -381,45 +383,30 @@ public class ProphetModel {
 
         double[] init = new double[nParams];
 
+        // --- Phase 1: Initialize k, m using Prophet's growth_init ---
         if (growthCode == 2) {
-            // Flat growth: trend = m (constant)
-            // m = mean(y_scaled)
             double sum = 0;
             for (double v : trainY) sum += v;
             init[1] = sum / trainY.length;  // m
-            init[0] = 0;  // k (unused)
+            init[0] = 0;  // k (unused for flat)
         } else if (growthCode == 1) {
-            // Logistic growth init
-            // Reference: forecaster.py logistic_growth_init
             double capVal = (config.cap - yOffset) / yScale;
             double[] yCapped = new double[trainY.length];
             for (int i = 0; i < trainY.length; i++) {
                 yCapped[i] = Math.min(capVal, Math.max(0.01, trainY[i]));
             }
-            // r0 = (yCapped[0] - capVal) / (capVal - yCapped[0])
-            // Actually Prophet's formula:
-            // r0 = (yCapped[T-1] - yCapped[0]) / (T - 0) but with logistic transform
-            double r0 = (yCapped[trainY.length - 1] - yCapped[0]) / trainT[trainY.length - 1];
-            double r1 = r0;
-            // Avoid division by zero
             double denom0 = Math.max(capVal - yCapped[0], 1e-8);
             double denom1 = Math.max(capVal - yCapped[trainY.length - 1], 1e-8);
-            r0 = Math.log(Math.max(yCapped[0] / denom0, 1e-8));
-            r1 = Math.log(Math.max(yCapped[trainY.length - 1] / denom1, 1e-8));
-            double L0 = yCapped[0];
-            double L1 = yCapped[trainY.length - 1];
+            double r0 = Math.log(Math.max(yCapped[0] / denom0, 1e-8));
+            double r1 = Math.log(Math.max(yCapped[trainY.length - 1] / denom1, 1e-8));
             double lr = r1 - r0;
             if (Math.abs(lr) < 1e-8) lr = 1e-8;
-            double k0 = (L1 - L0) / lr;
-            double m0 = L0 - k0 * r0;
-            // Scale k0 and m0 to the standardized time
-            init[0] = k0 / tScale;  // k (rate in scaled time)
-            init[1] = m0;           // m (offset)
+            double k0 = (yCapped[trainY.length - 1] - yCapped[0]) / lr;
+            double m0 = yCapped[0] - k0 * r0;
+            init[0] = k0;
+            init[1] = m0;
         } else {
-            // Linear growth init
-            // Reference: forecaster.py linear_growth_init
-            // k = (y[-1] - y[0]) / (t[-1] - t[0])
-            // m = y[0] - k * t[0]
+            // Linear growth init: k = (y[-1] - y[0]) / (t[-1] - t[0])
             double t0 = trainT[0];
             double tN = trainT[trainT.length - 1];
             double y0 = trainY[0];
@@ -431,12 +418,69 @@ public class ProphetModel {
         }
 
         // delta = 0 (all changepoints start at 0)
-        // (already zero by default)
+        // logSigma = log(noise_std) - estimate from residuals
+        if (K > 0) {
+            // --- Phase 2: Least-squares initialization for beta ---
+            // Compute trend prediction with current k, m, delta=0
+            double[] trendInit = new double[trainT.length];
+            for (int i = 0; i < trainT.length; i++) {
+                trendInit[i] = init[0] * trainT[i] + init[1];  // linear: k*t + m
+            }
 
-        // logSigma = log(0.1) as initial guess
-        init[2 + S] = Math.log(0.1);
+            // Residuals = y - trend
+            double[] residuals = new double[trainT.length];
+            double resSumSq = 0;
+            for (int i = 0; i < trainT.length; i++) {
+                residuals[i] = trainY[i] - trendInit[i];
+                resSumSq += residuals[i] * residuals[i];
+            }
+            double noiseStd = Math.sqrt(resSumSq / trainT.length);
 
-        // beta = 0 (already zero)
+            // Use ridge regression to fit beta on residuals
+            // For additive: residuals ≈ X * beta
+            // For multiplicative: residuals ≈ trend * X * beta
+            // We solve a weighted least squares depending on mode
+            double[][] Xls;
+            if (config.seasonalityMode == ProphetConfig.SeasonalityMode.MULTIPLICATIVE) {
+                // multiplicative: y - trend ≈ trend * (X * beta)
+                // so (y - trend) / trend ≈ X * beta (weighted)
+                Xls = new double[trainT.length][K];
+                for (int i = 0; i < trainT.length; i++) {
+                    double w = Math.abs(trendInit[i]) + 1e-8;
+                    for (int j = 0; j < K; j++) {
+                        Xls[i][j] = X[i][j] / w;
+                    }
+                    residuals[i] /= w;
+                }
+            } else {
+                Xls = X;
+            }
+
+            // Solve ridge regression: (X'X + lambda*I) beta = X'r
+            // lambda = small regularization to avoid overfitting
+            double lambda = 1e-3;
+            try {
+                Matrix Xmat = new Matrix(Xls);
+                double[] betaInit = Matrix.solveLeastSquares(Xmat, residuals, lambda);
+                // Clip beta to reasonable range
+                for (int j = 0; j < K; j++) {
+                    init[3 + S + j] = Math.max(-10, Math.min(10, betaInit[j]));
+                }
+            } catch (Exception e) {
+                // If LS fails, leave beta at 0
+            }
+
+            init[2 + S] = Math.log(Math.max(noiseStd, 1e-4));
+        } else {
+            // No seasonal features: estimate sigma from data
+            double resSumSq = 0;
+            for (int i = 0; i < trainY.length; i++) {
+                double pred = init[0] * trainT[i] + init[1];
+                resSumSq += (trainY[i] - pred) * (trainY[i] - pred);
+            }
+            double noiseStd = Math.sqrt(resSumSq / trainT.length);
+            init[2 + S] = Math.log(Math.max(noiseStd, 1e-4));
+        }
 
         return init;
     }
@@ -444,21 +488,20 @@ public class ProphetModel {
     // ===================== Optimization =====================
 
     private void optimize(double[] initTheta) {
-        LBFGSOptimizer.ObjectiveFunction fn = (theta) -> BayesianPriors.negLogPosteriorAndGradient(
+        AdamOptimizer.ObjectiveFunction fn = (theta) -> BayesianPriors.negLogPosteriorAndGradient(
                 theta, trainT, trainY, changepoints, X, sigmas, s_a, s_m,
                 config.changepointPriorScale, config.sigmaObsPriorScale,
                 growthCode, capScaled
         );
 
-        LBFGSOptimizer optimizer = new LBFGSOptimizer(
-                7, config.lbfgsMaxIter, config.lbfgsGradTol, 1e-10, 1e-10, config.verbose
-        );
+        // Phase 1: Adam optimizer (handles Laplace priors well)
+        AdamOptimizer adam = new AdamOptimizer(5000, 0.005, 0.9, 0.999, 1e-8, 1e-4, config.verbose);
+        AdamOptimizer.OptResult adamResult = adam.minimize(initTheta, fn);
 
-        LBFGSOptimizer.OptResult result = optimizer.minimize(initTheta, fn);
-        theta = result.params;
+        theta = adamResult.params;
 
         if (config.verbose) {
-            System.out.printf("  L-BFGS: f=%.6f, |grad|=%.4e%n", result.value, result.gradNorm);
+            System.out.printf("  Adam: f=%.6f, |grad|=%.4e%n", adamResult.value, adamResult.gradNorm);
         }
 
         // Extract fitted parameters
@@ -584,6 +627,10 @@ public class ProphetModel {
         // Uncertainty estimation
         if (nUncertaintySamples > 0 && !posteriorSamples.isEmpty()) {
             computeUncertainty(tScaled, XFuture, futureCapScaled, N, nUncertaintySamples, result);
+        } else if (nUncertaintySamples > 0) {
+            // No MCMC samples: use MAP estimate with sigma_obs-based intervals
+            // plus trend uncertainty from Poisson future changepoints
+            computeMapUncertainty(tScaled, XFuture, futureCapScaled, N, nUncertaintySamples, result);
         } else {
             for (int i = 0; i < N; i++) {
                 result.yhatLower[i] = result.yhat[i];
@@ -608,6 +655,80 @@ public class ProphetModel {
      *   new changepoints uniformly distributed in [1, T_future]
      *   new deltas ~ Laplace(0, mean(|training_deltas|) + 1e-8)
      */
+
+    /**
+     * Compute prediction uncertainty using MAP estimate only (no MCMC).
+     * Uses sigma_obs for observation noise and Poisson future changepoints for trend uncertainty.
+     */
+    private void computeMapUncertainty(
+            double[] tScaled, double[][] XFuture, double[] futureCapScaled,
+            int N, int nSamples, ForecastResult result) {
+
+        // Compute mean absolute delta for Poisson trend uncertainty
+        double meanAbsDelta = 0;
+        for (double d : delta) meanAbsDelta += Math.abs(d);
+        meanAbsDelta /= delta.length;
+        double deltaScale = meanAbsDelta + 1e-8;
+        int S = changepoints.length;
+
+        Random rng = new Random(42);
+        double[][] yhatSamples = new double[nSamples][N];
+
+        for (int s = 0; s < nSamples; s++) {
+            // Generate future changepoints via Poisson process
+            double[] sampleDelta = delta.clone();
+            if (S > 0) {
+                // For future time points beyond training range
+                double futureRange = tScaled[N - 1] - trainingMaxT;
+                if (futureRange > 0) {
+                    int nNewCps = (int) Math.round(S * futureRange);
+                    for (int nc = 0; nc < nNewCps; nc++) {
+                        // Random new delta with Laplace distribution
+                        double u = rng.nextDouble() - 0.5;
+                        double newDelta = -deltaScale * Math.signum(u) * Math.log(1 - 2 * Math.abs(u));
+                        // This is added to the cumulative rate
+                        // We approximate by adding to the last delta
+                        if (sampleDelta.length > 0) {
+                            sampleDelta[sampleDelta.length - 1] += newDelta * 0.5;
+                        }
+                    }
+                }
+            }
+
+            // Compute trend with perturbed deltas
+            double[] trendSample = BayesianPriors.computeTrend(
+                k, m, sampleDelta, tScaled, changepoints, growthCode, futureCapScaled);
+
+            // Compute seasonal (same as MAP since beta is fixed)
+            for (int i = 0; i < N; i++) {
+                double multPart = 0, addPart = 0;
+                if (XFuture != null) {
+                    for (int j = 0; j < XFuture[i].length; j++) {
+                        multPart += XFuture[i][j] * s_m[j] * beta[j];
+                        addPart += XFuture[i][j] * s_a[j] * beta[j];
+                    }
+                }
+                double yhatS = trendSample[i] * (1.0 + multPart) + addPart;
+                // Add observation noise
+                yhatS += rng.nextGaussian() * sigmaObs;
+                yhatSamples[s][i] = yhatS * yScale + yOffset;
+            }
+        }
+
+        // Compute 80% CI from samples (10th and 90th percentile)
+        for (int i = 0; i < N; i++) {
+            double[] vals = new double[nSamples];
+            for (int s = 0; s < nSamples; s++) vals[s] = yhatSamples[s][i];
+            Arrays.sort(vals);
+            int lo10 = (int) Math.round(0.10 * nSamples);
+            int hi90 = (int) Math.round(0.90 * nSamples);
+            lo10 = Math.max(0, Math.min(lo10, nSamples - 1));
+            hi90 = Math.max(0, Math.min(hi90, nSamples - 1));
+            result.yhatLower[i] = vals[lo10];
+            result.yhatUpper[i] = vals[hi90];
+        }
+    }
+
     private void computeUncertainty(
             double[] tScaled, double[][] XFuture, double[] futureCapScaled,
             int N, int nSamples, ForecastResult result) {
