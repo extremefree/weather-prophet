@@ -1,605 +1,826 @@
 package com.weather.prophet.core;
 
-import com.weather.prophet.compute.ComputeBackend;
-import com.weather.prophet.compute.CPUBackend;
-import com.weather.prophet.compute.GPUBackend;
 import com.weather.prophet.data.DataPoint;
-import com.weather.prophet.mcmc.MCMCSampler;
+import com.weather.prophet.matrix.Matrix;
+import com.weather.prophet.matrix.VecOps;
 import com.weather.prophet.optimize.BayesianPriors;
 import com.weather.prophet.optimize.LBFGSOptimizer;
+import com.weather.prophet.mcmc.MCMCSampler;
+import com.weather.prophet.compute.CPUBackend;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 
 /**
- * ProphetModel — Faithful Java implementation of Facebook Prophet.
+ * Faithful Java port of Facebook Prophet.
  *
- * Algorithm (exactly following Prophet's source code):
+ * Key references:
+ *   - python/prophet/forecaster.py  (Prophet class)
+ *   - python/stan/prophet.stan       (Stan model)
  *
- * 1. PREPROCESSING:
- *    - Scale y to have zero mean (Prophet scales data internally)
- *    - Auto-place changepoints in first 80% of history
- *    - Build Fourier feature matrices for seasonality
- *    - Build holiday feature matrix
+ * y(t) = g(t) + s(t) + h(t) + ε         (additive)
+ * y(t) = g(t) * (1 + s(t) + h(t)) + ε   (multiplicative)
  *
- * 2. FITTING (MAP via L-BFGS, same as Stan's optimizing()):
- *    - Define negative log posterior = -(log likelihood + log priors)
- *    - Priors (from Prophet's Stan model):
- *      * k ~ Normal(0, 5)
- *      * m ~ Normal(0, 5)
- *      * delta ~ Laplace(0, tau)    ← L1 regularization for sparse changepoints
- *      * sigma_obs ~ HalfCauchy(0, scale)
- *      * beta ~ Normal(0, sigma_beta)
- *      * kappa ~ Normal(0, sigma_kappa)
- *    - Minimize using L-BFGS (same algorithm as Stan's optimizer)
- *
- * 3. MCMC POSTERIOR SAMPLING (same as Stan's sampling()):
- *    - If mcmc_samples > 0: run NUTS (No-U-Turn Sampler)
- *    - Multiple chains run in parallel (GPU-accelerated if available)
- *    - Used for proper Bayesian uncertainty quantification
- *
- * 4. PREDICTION:
- *    - y_hat = g(t) + s(t) + h(t)     (additive)
- *    - y_hat = g(t) * (1 + s(t) + h(t))  (multiplicative)
- *    - Uncertainty from:
- *      a) Trend: sample delta from Laplace, add noise
- *      b) Observation: sample from N(0, sigma_obs)
- *      c) MCMC posterior samples (if available)
- *
- * 5. TREND FORMULAS (from Prophet's Stan model):
- *    Linear:  g(t) = (k + A(t)^T * delta) * t + (m + A(t)^T * gamma)
- *    Logistic: g(t) = C / (1 + exp(-(k+A^T*d) * (t - (m+A^T*gamma))))
- *    where gamma_j = -s_j * delta_j  (continuity constraint)
+ * where:
+ *   g(t) = trend (linear / logistic / flat)
+ *   s(t) = seasonality (Fourier series)
+ *   h(t) = holiday effects
+ *   ε    ~ Normal(0, sigma_obs)
  */
 public class ProphetModel {
 
     private final ProphetConfig config;
-    private final ComputeBackend compute;
 
-    // Fitted parameters (MAP)
-    private double k;           // base growth rate
-    private double m;           // base offset
-    private double[] delta;     // changepoint rate changes
-    private double sigmaObs;    // observation noise
-    private double[] beta;      // seasonality coefficients
-    private double[] kappa;     // holiday coefficients
+    // Training data (standardized)
+    private double[] trainT;       // scaled time in [0, 1]
+    private double[] trainY;       // scaled y = (y - floor) / y_scale
+    private double[] changepoints; // scaled changepoint times
+    private double[][] XSeasonal;  // Fourier features
+    private double[][] XHoliday;   // Holiday features
+    private double[][] X;          // Combined feature matrix [seasonal | holiday]
+    private double[] sigmas;        // Per-component prior scales
+    private double[] s_a;           // Additive indicator vector
+    private double[] s_m;           // Multiplicative indicator vector
+    private double[] capScaled;     // Standardized cap (for logistic)
+    private double yScale;          // absmax(y - floor) or (max - min) for minmax
+    private double yOffset;         // floor value
+    private double tMin, tScale;    // Time scaling params
+    private double trainingMaxT;    // Max scaled time in training data
 
-    // Changepoints
-    private double[] changepoints;
-
-    // Feature matrices (cached for prediction)
-    private double[][] XSeasonal;    // T x K
-    private double[][] XHoliday;     // T x H
-
-    // Training data (scaled)
-    private double[] trainT;
-    private double[] trainY;
-    private double yMean;       // for scaling back
-    private double yStd;
+    // Fitted parameters
+    private double[] theta;         // [k, m, delta..., logSigma, beta...]
+    private double k, m;
+    private double[] delta;
+    private double sigmaObs;
+    private double[] beta;
 
     // MCMC samples
-    private double[][] mcmcSamples; // [numSamples][numParams]
+    private List<double[]> posteriorSamples;
 
-    // Training data bounds (for trend uncertainty)
-    private double trainingMaxT;
-
-    // Status
-    private boolean fitted = false;
+    // Growth type code: 0=linear, 1=logistic, 2=flat
+    private int growthCode;
 
     public ProphetModel(ProphetConfig config) {
         this.config = config;
-        // Try GPU first, fall back to CPU
-        GPUBackend gpu = new GPUBackend();
-        if (gpu.isAvailable()) {
-            this.compute = gpu;
-        } else {
-            this.compute = new CPUBackend();
-        }
-        if (config.verbose) {
-            System.out.println("[Prophet] Compute backend: " + compute.getType());
-        }
+        this.growthCode = config.growth == ProphetConfig.GrowthType.LINEAR ? 0
+                       : config.growth == ProphetConfig.GrowthType.LOGISTIC ? 1 : 2;
     }
 
-    public ProphetModel() {
-        this(new ProphetConfig());
-    }
+    // ===================== Fit =====================
 
-    /**
-     * Fit the Prophet model — exactly following Prophet's fit() method.
-     *
-     * Steps:
-     * 1. Preprocess and scale data
-     * 2. Auto-place changepoints
-     * 3. Build feature matrices (Fourier + holiday)
-     * 4. Initialize parameters
-     * 5. Optimize via L-BFGS (MAP estimation)
-     * 6. Optionally run MCMC (posterior sampling)
-     */
     public void fit(List<DataPoint> data) {
-        if (config.verbose) System.out.println("[Prophet] Fitting model on " + data.size() + " data points...");
+        if (config.verbose) System.out.println("[Prophet] Fitting model with "
+            + data.size() + " observations, growth=" + config.growth);
 
+        // --- 1. Setup time scaling ---
+        // Reference: forecaster.py setup_dataframe, __init__ self._self.t_scale
+        double tMinRaw = Double.MAX_VALUE, tMaxRaw = Double.MIN_VALUE;
+        for (DataPoint dp : data) {
+            if (dp.getTimestamp() < tMinRaw) tMinRaw = dp.getTimestamp();
+            if (dp.getTimestamp() > tMaxRaw) tMaxRaw = dp.getTimestamp();
+        }
+        this.tMin = tMinRaw;
+        this.tScale = tMaxRaw - tMinRaw;
+        if (tScale < 1e-10) tScale = 1.0;
+
+        // --- 2. Setup y scaling ---
+        // Reference: forecaster.py setup_dataframe, self.y_scale
+        // Prophet uses absmax: y_scale = max(abs(y - floor))
+        // or minmax: y_scale = max(y-floor) - min(y-floor)
+        this.yOffset = config.floor;
+        double yMin = Double.MAX_VALUE, yMax = Double.MIN_VALUE;
+        double yAbsMax = 0;
+        for (DataPoint dp : data) {
+            double val = dp.getValue() - yOffset;
+            if (val < yMin) yMin = val;
+            if (val > yMax) yMax = val;
+            if (Math.abs(val) > yAbsMax) yAbsMax = Math.abs(val);
+        }
+        if (config.scaling == ProphetConfig.Scaling.MINMAX) {
+            this.yScale = yMax - yMin;
+        } else {
+            this.yScale = yAbsMax;
+        }
+        if (this.yScale < 1e-10) this.yScale = 1.0;
+
+        // --- 3. Scale data ---
         int T = data.size();
-
-        // Step 1: Scale data (Prophet internally scales y)
-        yMean = 0;
-        for (DataPoint dp : data) yMean += dp.getValue();
-        yMean /= T;
-        double sumSq = 0;
-        for (DataPoint dp : data) sumSq += (dp.getValue() - yMean) * (dp.getValue() - yMean);
-        yStd = Math.sqrt(sumSq / T);
-        if (yStd < 1e-10) yStd = 1.0;
-
-        trainT = new double[T];
-        trainY = new double[T];
+        this.trainT = new double[T];
+        this.trainY = new double[T];
         for (int i = 0; i < T; i++) {
-            trainT[i] = data.get(i).getTimestamp();
-            trainY[i] = (data.get(i).getValue() - yMean) / yStd; // standardize
+            DataPoint dp = data.get(i);
+            trainT[i] = (dp.getTimestamp() - tMin) / tScale;   // scaled to [0, 1]
+            trainY[i] = (dp.getValue() - yOffset) / yScale; // scaled (no mean centering!)
+        }
+        this.trainingMaxT = trainT[T - 1];
+
+        // --- 4. Set changepoints ---
+        // Reference: forecaster.py set_changepoints
+        // Prophet: cp_indexes = np.linspace(0, hist_size-1, n+1).round().astype(int)
+        //          changepoints = hist[cp_indexes].tail(-1)  (drop first = index 0)
+        setChangepoints(T);
+
+        // --- 5. Build seasonal features ---
+        // Reference: forecaster.py make_all_seasonality_features
+        buildSeasonalFeatures(T);
+
+        // --- 6. Build holiday features ---
+        buildHolidayFeatures(T);
+
+        // --- 7. Combine features and set indicators ---
+        combineFeatures();
+
+        // --- 8. Standardize cap for logistic ---
+        if (growthCode == 1) {
+            capScaled = new double[T];
+            double capVal = (config.cap - yOffset) / yScale;
+            Arrays.fill(capScaled, capVal);
         }
 
-        // Step 2: Auto-place changepoints in first 80% of history
-        double tMin = trainT[0];
-        double tMax = trainT[T - 1];
-        trainingMaxT = tMax;
-        double changepointEnd = tMin + config.changepointRange * (tMax - tMin);
-        changepoints = new double[config.nChangepoints];
-        double step = (changepointEnd - tMin) / config.nChangepoints;
-        for (int i = 0; i < config.nChangepoints; i++) {
-            changepoints[i] = tMin + (i + 1) * step;
+        // --- 9. Initialize trend parameters ---
+        // Reference: forecaster.py linear_growth_init / logistic_growth_init / flat_growth_init
+        double[] initTheta = initializeTrendParams();
+
+        // --- 10. Optimize (L-BFGS MAP estimate) ---
+        if (config.verbose) System.out.println("[Prophet] Running L-BFGS optimization (MAP estimate)...");
+        optimize(initTheta);
+
+        // --- 11. MCMC if requested ---
+        if (config.mcmcSamples > 0) {
+            runMCMC();
+        } else {
+            posteriorSamples = new ArrayList<>();
+            posteriorSamples.add(theta.clone());
         }
 
-        int S = changepoints.length;
+        if (config.verbose) {
+            System.out.printf("[Prophet] Fit complete. k=%.4f m=%.4f sigma_obs=%.4f%n",
+                k, m, sigmaObs);
+            int significantCP = 0;
+            for (double d : delta) if (Math.abs(d) > 1e-6) significantCP++;
+            System.out.printf("[Prophet] Changepoints: %d/%d significant, beta dim=%d%n",
+                significantCP, delta.length, beta.length);
+        }
+    }
 
-        // Step 3: Build Fourier feature matrices (GPU-accelerated)
-        int K = 0; // total seasonal features
-        List<double[][]> seasonalFeatures = new ArrayList<>();
+    // ===================== Changepoints =====================
+
+    private void setChangepoints(int histSize) {
+        // Reference: forecaster.py set_changepoints
+        // cp_indexes = np.linspace(0, hist_size - 1, n_changepoints + 1).round().astype(int)
+        // changepoints = hist_dates[cp_indexes].tail(-1)  # drop the first one
+        int n = config.nChangepoints;
+        if (n <= 0 || histSize < 2) {
+            changepoints = new double[0];
+            return;
+        }
+        // changepoint_range limits where changepoints can be placed
+        int histRange = (int) Math.ceil(histSize * config.changepointRange);
+        if (histRange < 2) histRange = histSize;
+
+        int[] cpIndexes = new int[n + 1];
+        for (int i = 0; i <= n; i++) {
+            double idx = (double) i * (histRange - 1) / n;
+            cpIndexes[i] = (int) Math.round(idx);
+        }
+
+        // Drop the first (index 0), take the rest
+        changepoints = new double[n];
+        for (int i = 1; i <= n; i++) {
+            int dataIdx = Math.min(cpIndexes[i], histSize - 1);
+            changepoints[i - 1] = trainT[dataIdx];
+        }
+
+        // Sort (should already be sorted)
+        Arrays.sort(changepoints);
+    }
+
+    // ===================== Seasonal Features =====================
+
+    private void buildSeasonalFeatures(int T) {
+        // Reference: forecaster.py fourier_series + make_all_seasonality_features
+        List<double[]> featureList = new ArrayList<>();
+        List<Double> sigmaList = new ArrayList<>();
+
         if (config.yearlySeasonality) {
-            double[][] xf = compute.computeFourierFeatures(trainT, config.yearlyFourierOrder, 365.25);
-            seasonalFeatures.add(xf);
-            K += xf[0].length;
-        }
-        if (config.weeklySeasonality) {
-            double[][] xf = compute.computeFourierFeatures(trainT, config.weeklyFourierOrder, 7.0);
-            seasonalFeatures.add(xf);
-            K += xf[0].length;
-        }
-        // Concatenate seasonal features
-        XSeasonal = new double[T][K];
-        int colOffset = 0;
-        for (double[][] xf : seasonalFeatures) {
-            for (int i = 0; i < T; i++) {
-                System.arraycopy(xf[i], 0, XSeasonal[i], colOffset, xf[i].length);
+            int order = config.yearlyFourierOrder;
+            double period = config.yearlyPeriod;
+            for (int k = 1; k <= order; k++) {
+                double[] sinCol = new double[T];
+                double[] cosCol = new double[T];
+                double arg = 2 * Math.PI * k / period;
+                for (int i = 0; i < T; i++) {
+                    // Time in original units (days), not scaled
+                    double days = trainT[i] * tScale + tMin;
+                    sinCol[i] = Math.sin(days * arg);
+                    cosCol[i] = Math.cos(days * arg);
+                }
+                featureList.add(sinCol);
+                featureList.add(cosCol);
+                sigmaList.add(config.yearlySeasonalityPriorScale);
+                sigmaList.add(config.yearlySeasonalityPriorScale);
             }
-            colOffset += xf[0].length;
         }
 
-        // Build holiday features
-        int H = config.holidays.size();
-        XHoliday = new double[T][H];
-        for (int i = 0; i < T; i++) {
-            double ti = trainT[i];
-            for (int j = 0; j < H; j++) {
-                ProphetConfig.HolidaySpec hol = config.holidays.get(j);
-                double diff = ti - hol.timestamp;
-                if (diff >= -hol.windowBefore && diff <= hol.windowAfter) {
-                    double sigma = (hol.windowBefore + hol.windowAfter) / 2.0;
-                    XHoliday[i][j] = Math.exp(-0.5 * diff * diff / (sigma * sigma));
+        if (config.weeklySeasonality) {
+            int order = config.weeklyFourierOrder;
+            double period = config.weeklyPeriod;
+            for (int k = 1; k <= order; k++) {
+                double[] sinCol = new double[T];
+                double[] cosCol = new double[T];
+                double arg = 2 * Math.PI * k / period;
+                for (int i = 0; i < T; i++) {
+                    double days = trainT[i] * tScale + tMin;
+                    sinCol[i] = Math.sin(days * arg);
+                    cosCol[i] = Math.cos(days * arg);
+                }
+                featureList.add(sinCol);
+                featureList.add(cosCol);
+                sigmaList.add(config.weeklySeasonalityPriorScale);
+                sigmaList.add(config.weeklySeasonalityPriorScale);
+            }
+        }
+
+        if (config.dailySeasonality) {
+            int order = config.dailyFourierOrder;
+            double period = config.dailyPeriod;
+            for (int k = 1; k <= order; k++) {
+                double[] sinCol = new double[T];
+                double[] cosCol = new double[T];
+                double arg = 2 * Math.PI * k / period;
+                for (int i = 0; i < T; i++) {
+                    double days = trainT[i] * tScale + tMin;
+                    sinCol[i] = Math.sin(days * arg);
+                    cosCol[i] = Math.cos(days * arg);
+                }
+                featureList.add(sinCol);
+                featureList.add(cosCol);
+                sigmaList.add(config.dailySeasonalityPriorScale);
+                sigmaList.add(config.dailySeasonalityPriorScale);
+            }
+        }
+
+        // Convert list to 2D array
+        int K = featureList.size();
+        if (K > 0) {
+            XSeasonal = new double[T][K];
+            for (int j = 0; j < K; j++) {
+                double[] col = featureList.get(j);
+                for (int i = 0; i < T; i++) {
+                    XSeasonal[i][j] = col[i];
                 }
             }
+        } else {
+            XSeasonal = null;
         }
+
+        // Store seasonal sigmas
+        seasonalSigmas = sigmaList.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    private double[] seasonalSigmas;
+
+    // ===================== Holiday Features =====================
+
+    private void buildHolidayFeatures(int T) {
+        if (config.holidays.isEmpty()) {
+            XHoliday = null;
+            return;
+        }
+
+        // Reference: forecaster.py make_holiday_features
+        // Each holiday generates columns for [window_before, day_of, window_after]
+        List<double[]> featureList = new ArrayList<>();
+        List<Double> sigmaList = new ArrayList<>();
+
+        for (ProphetConfig.HolidaySpec hol : config.holidays) {
+            double holDay = hol.timestamp;
+            int wb = hol.windowBefore;
+            int wa = hol.windowAfter;
+
+            // Window days: -wb, ..., 0, ..., +wa
+            for (int offset = -wb; offset <= wa; offset++) {
+                double[] col = new double[T];
+                double targetDay = holDay + offset;
+                for (int i = 0; i < T; i++) {
+                    double days = trainT[i] * tScale + tMin;
+                    col[i] = Math.abs(days - targetDay) < 0.5 ? 1.0 : 0.0;
+                }
+                featureList.add(col);
+                sigmaList.add(config.holidaysPriorScale);
+            }
+        }
+
+        int K = featureList.size();
+        XHoliday = new double[T][K];
+        for (int j = 0; j < K; j++) {
+            double[] col = featureList.get(j);
+            for (int i = 0; i < T; i++) {
+                XHoliday[i][j] = col[i];
+            }
+        }
+        holidaySigmas = sigmaList.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    private double[] holidaySigmas;
+
+    // ===================== Combine Features =====================
+
+    private void combineFeatures() {
+        int Ks = XSeasonal != null ? XSeasonal[0].length : 0;
+        int Kh = XHoliday != null ? XHoliday[0].length : 0;
+        int K = Ks + Kh;
+        int T = trainT.length;
+
+        if (K == 0) {
+            X = null;
+            sigmas = new double[0];
+            s_a = new double[0];
+            s_m = new double[0];
+            return;
+        }
+
+        X = new double[T][K];
+        sigmas = new double[K];
+        s_a = new double[K];
+        s_m = new double[K];
+
+        boolean isAdditive = config.seasonalityMode == ProphetConfig.SeasonalityMode.ADDITIVE;
+        boolean holidaysAdditive = config.getHolidaysMode() == ProphetConfig.SeasonalityMode.ADDITIVE;
+
+        for (int i = 0; i < T; i++) {
+            int col = 0;
+            // Seasonal features
+            for (int j = 0; j < Ks; j++) {
+                X[i][col] = XSeasonal[i][j];
+                sigmas[col] = seasonalSigmas[j];
+                s_a[col] = isAdditive ? 1.0 : 0.0;
+                s_m[col] = isAdditive ? 0.0 : 1.0;
+                col++;
+            }
+            // Holiday features
+            for (int j = 0; j < Kh; j++) {
+                X[i][col] = XHoliday[i][j];
+                sigmas[col] = holidaySigmas[j];
+                s_a[col] = holidaysAdditive ? 1.0 : 0.0;
+                s_m[col] = holidaysAdditive ? 0.0 : 1.0;
+                col++;
+            }
+        }
+    }
+
+    // ===================== Trend Initialization =====================
+
+    /**
+     * Initialize trend parameters using Prophet's growth_init methods.
+     * Reference: forecaster.py linear_growth_init, logistic_growth_init, flat_growth_init
+     */
+    private double[] initializeTrendParams() {
+        int S = changepoints.length;
+        int K = X != null ? X[0].length : 0;
+        int nParams = 3 + S + K;
+
+        double[] init = new double[nParams];
+
+        if (growthCode == 2) {
+            // Flat growth: trend = m (constant)
+            // m = mean(y_scaled)
+            double sum = 0;
+            for (double v : trainY) sum += v;
+            init[1] = sum / trainY.length;  // m
+            init[0] = 0;  // k (unused)
+        } else if (growthCode == 1) {
+            // Logistic growth init
+            // Reference: forecaster.py logistic_growth_init
+            double capVal = (config.cap - yOffset) / yScale;
+            double[] yCapped = new double[trainY.length];
+            for (int i = 0; i < trainY.length; i++) {
+                yCapped[i] = Math.min(capVal, Math.max(0.01, trainY[i]));
+            }
+            // r0 = (yCapped[0] - capVal) / (capVal - yCapped[0])
+            // Actually Prophet's formula:
+            // r0 = (yCapped[T-1] - yCapped[0]) / (T - 0) but with logistic transform
+            double r0 = (yCapped[trainY.length - 1] - yCapped[0]) / trainT[trainY.length - 1];
+            double r1 = r0;
+            // Avoid division by zero
+            double denom0 = Math.max(capVal - yCapped[0], 1e-8);
+            double denom1 = Math.max(capVal - yCapped[trainY.length - 1], 1e-8);
+            r0 = Math.log(Math.max(yCapped[0] / denom0, 1e-8));
+            r1 = Math.log(Math.max(yCapped[trainY.length - 1] / denom1, 1e-8));
+            double L0 = yCapped[0];
+            double L1 = yCapped[trainY.length - 1];
+            double lr = r1 - r0;
+            if (Math.abs(lr) < 1e-8) lr = 1e-8;
+            double k0 = (L1 - L0) / lr;
+            double m0 = L0 - k0 * r0;
+            // Scale k0 and m0 to the standardized time
+            init[0] = k0 / tScale;  // k (rate in scaled time)
+            init[1] = m0;           // m (offset)
+        } else {
+            // Linear growth init
+            // Reference: forecaster.py linear_growth_init
+            // k = (y[-1] - y[0]) / (t[-1] - t[0])
+            // m = y[0] - k * t[0]
+            double t0 = trainT[0];
+            double tN = trainT[trainT.length - 1];
+            double y0 = trainY[0];
+            double yN = trainY[trainY.length - 1];
+            double dt = tN - t0;
+            if (Math.abs(dt) < 1e-10) dt = 1.0;
+            init[0] = (yN - y0) / dt;  // k
+            init[1] = y0 - init[0] * t0;  // m
+        }
+
+        // delta = 0 (all changepoints start at 0)
+        // (already zero by default)
+
+        // logSigma = log(0.1) as initial guess
+        init[2 + S] = Math.log(0.1);
+
+        // beta = 0 (already zero)
+
+        return init;
+    }
+
+    // ===================== Optimization =====================
+
+    private void optimize(double[] initTheta) {
+        LBFGSOptimizer.ObjectiveFunction fn = (theta) -> BayesianPriors.negLogPosteriorAndGradient(
+                theta, trainT, trainY, changepoints, X, sigmas, s_a, s_m,
+                config.changepointPriorScale, config.sigmaObsPriorScale,
+                growthCode, capScaled
+        );
+
+        LBFGSOptimizer optimizer = new LBFGSOptimizer(
+                7, config.lbfgsMaxIter, config.lbfgsGradTol, 1e-10, 1e-10, config.verbose
+        );
+
+        LBFGSOptimizer.OptResult result = optimizer.minimize(initTheta, fn);
+        theta = result.params;
 
         if (config.verbose) {
-            System.out.printf("[Prophet] Features: %d changepoints, %d seasonal, %d holiday%n", S, K, H);
+            System.out.printf("  L-BFGS: f=%.6f, |grad|=%.4e%n", result.value, result.gradNorm);
         }
-
-        // Step 4: Initialize parameters
-        // k: linear regression slope, m: intercept, delta: zeros
-        double x0 = trainT[0], x1 = trainT[T - 1];
-        double y0 = trainY[0], y1 = trainY[T - 1];
-        double initK = (x1 != x0) ? (y1 - y0) / (x1 - x0) : 0;
-        double initM = y0 - initK * x0;
-
-        // Estimate initial sigma from residual of linear fit
-        double sumResid2 = 0;
-        for (int i = 0; i < T; i++) {
-            double pred = initK * trainT[i] + initM;
-            sumResid2 += (trainY[i] - pred) * (trainY[i] - pred);
-        }
-        double initSigma = Math.sqrt(sumResid2 / Math.max(T - 2, 1));
-        if (initSigma < 0.01) initSigma = 0.01;
-
-        int numParams = 3 + S + K + H; // k, m, delta[S], logSigma, beta[K], kappa[H]
-        double[] theta0 = new double[numParams];
-        theta0[0] = initK;       // k
-        theta0[1] = initM;       // m
-        // delta = 0 (default)
-        theta0[2 + S] = Math.log(initSigma); // log(sigma_obs) initial — data-driven estimate
-
-        // Step 5: L-BFGS optimization (MAP estimation)
-        if (config.verbose) System.out.println("[Prophet] Optimizing via L-BFGS (MAP estimation)...");
-
-        final int Sf = S, Kf = K, Hf = H;
-        final double[][] Xsf = XSeasonal, Xhf = XHoliday;
-        final double[] cp = changepoints;
-        final boolean logGrowth = config.growth == ProphetConfig.GrowthType.LOGISTIC;
-
-        LBFGSOptimizer.OptResult result = new LBFGSOptimizer(
-                7, config.lbfgsMaxIter, config.lbfgsGradTol, 1e-10, 1e-10, config.verbose
-        ).minimize(theta0, theta -> {
-            double[] nlpAndGrad = BayesianPriors.negLogPosteriorAndGradient(
-                    theta, trainT, trainY, cp, Xsf, Xhf,
-                    config.changepointPriorScale,
-                    config.seasonalityPriorScale,
-                    config.holidaysPriorScale,
-                    config.sigmaObsPriorScale,
-                    logGrowth,
-                    config.cap, yMean, yStd
-            );
-            // Expand to [value, gradient...]
-            double[] result1 = new double[1 + theta.length];
-            result1[0] = nlpAndGrad[0]; // neg log posterior value
-            System.arraycopy(nlpAndGrad, 1, result1, 1, theta.length);
-            return result1;
-        });
 
         // Extract fitted parameters
-        double[] optTheta = result.params;
-        k = optTheta[0];
-        m = optTheta[1];
-        delta = new double[S];
-        System.arraycopy(optTheta, 2, delta, 0, S);
-        sigmaObs = Math.exp(optTheta[2 + S]);
-        beta = new double[K];
-        if (K > 0) System.arraycopy(optTheta, 3 + S, beta, 0, K);
-        kappa = new double[H];
-        if (H > 0) System.arraycopy(optTheta, 3 + S + K, kappa, 0, H);
+        extractParams(theta);
+    }
+
+    private void extractParams(double[] theta) {
+        int S = changepoints.length;
+        int K = X != null ? X[0].length : 0;
+        this.theta = theta;
+        this.k = theta[0];
+        this.m = theta[1];
+        this.delta = new double[S];
+        System.arraycopy(theta, 2, delta, 0, S);
+        this.sigmaObs = Math.exp(theta[2 + S]);
+        this.beta = new double[K];
+        if (K > 0) System.arraycopy(theta, 3 + S, beta, 0, K);
+    }
+
+    // ===================== MCMC =====================
+
+    private void runMCMC() {
+        if (config.verbose) System.out.println("[Prophet] Running MCMC: "
+            + config.mcmcChains + " chains x " + config.mcmcSamples + " samples");
+
+        MCMCSampler.LogPosteriorFn logPostFn = (theta) -> {
+            double[] result = BayesianPriors.negLogPosteriorAndGradient(
+                    theta, trainT, trainY, changepoints, X, sigmas, s_a, s_m,
+                    config.changepointPriorScale, config.sigmaObsPriorScale,
+                    growthCode, capScaled
+            );
+            return -result[0];  // return logPosterior (negate negLogPost)
+        };
+
+        int samplesPerChain = Math.max(1, config.mcmcSamples / config.mcmcChains);
+        MCMCSampler sampler = new MCMCSampler(
+                samplesPerChain, config.mcmcWarmup, config.mcmcChains,
+                config.useNUTS, config.verbose
+        );
+
+        double[][] samples = sampler.sample(theta, logPostFn);
+
+        posteriorSamples = new ArrayList<>();
+        for (double[] s : samples) {
+            posteriorSamples.add(s.clone());
+        }
 
         if (config.verbose) {
-            System.out.printf("[Prophet] L-BFGS converged: negLogPost=%.6f, |grad|=%.2e%n",
-                    result.value, result.gradNorm);
-            System.out.printf("[Prophet] Fitted: k=%.6f, m=%.6f, sigma_obs=%.6f%n",
-                    k, m, sigmaObs);
-            int significant = 0;
-            for (double d : delta) if (Math.abs(d) > 1e-4) significant++;
-            System.out.printf("[Prophet] Changepoints: %d/%d significant%n",
-                    significant, S);
+            System.out.println("[Prophet] MCMC complete: " + posteriorSamples.size() + " posterior samples");
+        }
+    }
+
+    // ===================== Predict =====================
+
+    public static class ForecastResult {
+        public double[] t;        // original time values
+        public double[] yhat;     // point predictions (original scale)
+        public double[] yhatLower;  // lower bound (original scale)
+        public double[] yhatUpper;  // upper bound (original scale)
+        public double[] trend;    // trend component (original scale)
+        public double[] seasonal; // seasonal component (original scale)
+
+        public ForecastResult(int n) {
+            t = new double[n];
+            yhat = new double[n];
+            yhatLower = new double[n];
+            yhatUpper = new double[n];
+            trend = new double[n];
+            seasonal = new double[n];
+        }
+    }
+
+    public ForecastResult predict(double[] futureT) {
+        return predict(futureT, config.uncertaintySamples);
+    }
+
+    public ForecastResult predict(double[] futureT, int nUncertaintySamples) {
+        int N = futureT.length;
+
+        // Scale future time
+        double[] tScaled = new double[N];
+        for (int i = 0; i < N; i++) {
+            tScaled[i] = (futureT[i] - tMin) / tScale;
         }
 
-        // Step 6: MCMC posterior sampling (if configured)
-        if (config.mcmcSamples > 0) {
-            if (config.verbose) System.out.println("[Prophet] Running MCMC posterior sampling (NUTS)...");
+        // Scale cap for logistic
+        double[] futureCapScaled = null;
+        if (growthCode == 1) {
+            futureCapScaled = new double[N];
+            double capVal = (config.cap - yOffset) / yScale;
+            Arrays.fill(futureCapScaled, capVal);
+        }
 
-            MCMCSampler sampler = new MCMCSampler(
-                    config.mcmcSamples, config.mcmcWarmup,
-                    config.mcmcChains, config.useNUTS, config.verbose
+        // Build future features
+        double[][] XFuture = buildFutureFeatures(futureT, N);
+
+        // Point prediction using MAP estimate
+        double[] trendArr = BayesianPriors.computeTrend(k, m, delta, tScaled, changepoints, growthCode, futureCapScaled);
+
+        double[] yhatScaled = new double[N];
+        double[] seasonalArr = new double[N];
+        for (int i = 0; i < N; i++) {
+            double multPart = 0, addPart = 0;
+            if (XFuture != null) {
+                for (int j = 0; j < XFuture[i].length; j++) {
+                    multPart += XFuture[i][j] * s_m[j] * beta[j];
+                    addPart += XFuture[i][j] * s_a[j] * beta[j];
+                }
+            }
+            yhatScaled[i] = trendArr[i] * (1.0 + multPart) + addPart;
+            seasonalArr[i] = multPart * trendArr[i] + addPart;  // seasonal + holiday contribution
+        }
+
+        // Convert to original scale
+        ForecastResult result = new ForecastResult(N);
+        for (int i = 0; i < N; i++) {
+            result.t[i] = futureT[i];
+            result.yhat[i] = yhatScaled[i] * yScale + yOffset;
+            result.trend[i] = trendArr[i] * yScale + yOffset;
+            result.seasonal[i] = seasonalArr[i] * yScale;
+        }
+
+        // Uncertainty estimation
+        if (nUncertaintySamples > 0 && !posteriorSamples.isEmpty()) {
+            computeUncertainty(tScaled, XFuture, futureCapScaled, N, nUncertaintySamples, result);
+        } else {
+            for (int i = 0; i < N; i++) {
+                result.yhatLower[i] = result.yhat[i];
+                result.yhatUpper[i] = result.yhat[i];
+            }
+        }
+
+        return result;
+    }
+
+    // ===================== Uncertainty =====================
+
+    /**
+     * Compute prediction uncertainty using posterior samples.
+     *
+     * Reference: forecaster.py predict_uncertainty, predictive_samples,
+     *            sample_predictive_trend
+     *
+     * For future time points (t > trainingMaxT), Prophet generates new changepoints
+     * using a Poisson process:
+     *   n_changes ~ Poisson(S * (T_future - 1))
+     *   new changepoints uniformly distributed in [1, T_future]
+     *   new deltas ~ Laplace(0, mean(|training_deltas|) + 1e-8)
+     */
+    private void computeUncertainty(
+            double[] tScaled, double[][] XFuture, double[] futureCapScaled,
+            int N, int nSamples, ForecastResult result) {
+
+        // Determine number of historical vs future points
+        // Future points have t > trainingMaxT
+        Random rng = new Random(42);
+
+        // Compute mean |delta| for new changepoint generation
+        double meanAbsDelta = 0;
+        for (double d : delta) meanAbsDelta += Math.abs(d);
+        meanAbsDelta = meanAbsDelta / delta.length + 1e-8;
+
+        // Simulate nSamples posterior draws
+        double[][] simY = new double[nSamples][N];
+
+        for (int s = 0; s < nSamples; s++) {
+            // Sample from posterior (cycle through posterior samples)
+            double[] sample = posteriorSamples.get(s % posteriorSamples.size());
+            int S = changepoints.length;
+            int K = X != null ? X[0].length : 0;
+
+            double sK = sample[0];
+            double sM = sample[1];
+            double[] sDelta = new double[S];
+            System.arraycopy(sample, 2, sDelta, 0, S);
+            double sSigma = Math.exp(sample[2 + S]);
+            double[] sBeta = new double[K];
+            if (K > 0) System.arraycopy(sample, 3 + S, sBeta, 0, K);
+
+            // Generate trend with future changepoints (Poisson process)
+            double[] trendSim = samplePredictiveTrend(
+                    sK, sM, sDelta, tScaled, futureCapScaled, N, rng, meanAbsDelta
             );
 
-            MCMCSampler.LogPosteriorFn logPostFn = theta -> {
-                double[] nlp = BayesianPriors.negLogPosteriorAndGradient(
-                        theta, trainT, trainY, cp, Xsf, Xhf,
-                        config.changepointPriorScale,
-                        config.seasonalityPriorScale,
-                        config.holidaysPriorScale,
-                        config.sigmaObsPriorScale,
-                        logGrowth,
-                        config.cap, yMean, yStd
-                );
-                return -nlp[0]; // negate to get log posterior
-            };
-
-            mcmcSamples = sampler.sample(optTheta, logPostFn);
-            if (config.verbose) {
-                System.out.printf("[Prophet] MCMC complete: %d posterior samples from %d chains%n",
-                        mcmcSamples.length, config.mcmcChains);
+            // Add seasonal + holiday + noise
+            for (int i = 0; i < N; i++) {
+                double multPart = 0, addPart = 0;
+                if (XFuture != null) {
+                    for (int j = 0; j < XFuture[i].length; j++) {
+                        multPart += XFuture[i][j] * s_m[j] * sBeta[j];
+                        addPart += XFuture[i][j] * s_a[j] * sBeta[j];
+                    }
+                }
+                double yhat = trendSim[i] * (1.0 + multPart) + addPart;
+                // Add observation noise
+                simY[s][i] = yhat + rng.nextGaussian() * sSigma;
             }
         }
 
-        fitted = true;
-        if (config.verbose) System.out.println("[Prophet] Model fitting complete!");
+        // Compute percentiles
+        for (int i = 0; i < N; i++) {
+            double[] vals = new double[nSamples];
+            for (int s = 0; s < nSamples; s++) {
+                vals[s] = simY[s][i] * yScale + yOffset;
+            }
+            Arrays.sort(vals);
+            int lowerIdx = (int) Math.floor(0.1 * nSamples);
+            int upperIdx = (int) Math.ceil(0.9 * nSamples);
+            if (lowerIdx >= nSamples) lowerIdx = nSamples - 1;
+            if (upperIdx >= nSamples) upperIdx = nSamples - 1;
+            result.yhatLower[i] = vals[lowerIdx];
+            result.yhatUpper[i] = vals[upperIdx];
+        }
     }
 
     /**
-     * Predict — following Prophet's predict() method exactly.
+     * Sample predictive trend with Poisson-generated future changepoints.
      *
-     * y_hat(t) = g(t) + s(t) + h(t)            (additive)
-     * y_hat(t) = g(t) * (1 + s(t) + h(t))      (multiplicative)
+     * Reference: forecaster.py sample_predictive_trend
      *
-     * With uncertainty from posterior predictive simulation.
+     * For points beyond training data, generate new changepoints:
+     *   n_changes ~ Poisson(S * (T - 1))  where T is the future time horizon
+     *   new changepoints ~ Uniform[1, T]
+     *   new deltas ~ Laplace(0, mean(|training_deltas|))
      */
-    public ForecastResult predict(double[] futureT) {
-        if (!fitted) throw new IllegalStateException("Model must be fitted before prediction");
+    private double[] samplePredictiveTrend(
+            double sK, double sM, double[] sDelta,
+            double[] tScaled, double[] futureCapScaled,
+            int N, Random rng, double meanAbsDelta) {
 
-        int n = futureT.length;
-        int S = changepoints.length;
-        int K = beta.length;
-        int H = kappa.length;
+        int S = sDelta.length;
 
-        // Compute trend: g(t) = (k + A^T*delta) * t + (m + A^T*gamma)
-        double[] trend = new double[n];
-        for (int i = 0; i < n; i++) {
-            double ti = futureT[i];
-            double aDeltaSum = 0, aGammaSum = 0;
-            for (int j = 0; j < S; j++) {
-                double a = ti >= changepoints[j] ? 1.0 : 0.0;
-                aDeltaSum += a * delta[j];
-                aGammaSum += a * (-changepoints[j] * delta[j]); // gamma_j = -s_j * delta_j
+        // Determine if we have future points (t > trainingMaxT)
+        boolean hasFuture = false;
+        for (int i = 0; i < N; i++) {
+            if (tScaled[i] > trainingMaxT + 1e-10) {
+                hasFuture = true;
+                break;
             }
-            if (config.growth == ProphetConfig.GrowthType.LINEAR) {
-                trend[i] = (k + aDeltaSum) * ti + (m + aGammaSum);
+        }
+
+        if (!hasFuture || S == 0) {
+            // No future changepoints needed
+            return BayesianPriors.computeTrend(sK, sM, sDelta, tScaled, changepoints, growthCode, futureCapScaled);
+        }
+
+        // Generate future changepoints via Poisson process
+        double lambda = S * (tScaled[N - 1] - trainingMaxT) / Math.max(trainingMaxT, 1e-10);
+        // Cap lambda to avoid excessive changepoints
+        lambda = Math.min(lambda, 50);
+        int nFutureChanges = rng.nextDouble() < lambda ?
+                (int) Math.ceil(lambda) : (int) Math.floor(lambda);
+
+        if (nFutureChanges <= 0) {
+            return BayesianPriors.computeTrend(sK, sM, sDelta, tScaled, changepoints, growthCode, futureCapScaled);
+        }
+
+        // Generate future changepoint times and deltas
+        double[] futureCPs = new double[nFutureChanges];
+        double[] futureDeltas = new double[nFutureChanges];
+        for (int i = 0; i < nFutureChanges; i++) {
+            futureCPs[i] = trainingMaxT + rng.nextDouble() * (tScaled[N - 1] - trainingMaxT);
+            // delta ~ Laplace(0, meanAbsDelta)
+            double u = rng.nextDouble() - 0.5;
+            futureDeltas[i] = -2 * meanAbsDelta * Math.signum(u) * Math.log(1 - 2 * Math.abs(u));
+        }
+        Arrays.sort(futureCPs);
+
+        // Combine training + future changepoints
+        double[] allCPs = new double[S + nFutureChanges];
+        double[] allDeltas = new double[S + nFutureChanges];
+        System.arraycopy(changepoints, 0, allCPs, 0, S);
+        System.arraycopy(sDelta, 0, allDeltas, 0, S);
+        System.arraycopy(futureCPs, 0, allCPs, S, nFutureChanges);
+        System.arraycopy(futureDeltas, 0, allDeltas, S, nFutureChanges);
+
+        // Sort by changepoint time
+        // (changepoints should already be sorted, future ones are sorted)
+        // Merge sort the combined arrays
+        double[] sortedCPs = new double[S + nFutureChanges];
+        double[] sortedDeltas = new double[S + nFutureChanges];
+        int i1 = 0, i2 = 0;
+        for (int i = 0; i < S + nFutureChanges; i++) {
+            if (i2 >= nFutureChanges || (i1 < S && changepoints[i1] <= futureCPs[i2])) {
+                sortedCPs[i] = changepoints[i1];
+                sortedDeltas[i] = sDelta[i1];
+                i1++;
             } else {
-                // Logistic growth (in standardized space, cap must also be standardized)
-                double rate = k + aDeltaSum;
-                double offset = m + aGammaSum;
-                double C = (config.cap - yMean) / yStd; // standardize cap
-                trend[i] = C / (1.0 + Math.exp(-rate * (ti - offset)));
+                sortedCPs[i] = futureCPs[i2];
+                sortedDeltas[i] = futureDeltas[i2];
+                i2++;
             }
         }
 
-        // Compute seasonality: s(t) = X_seasonal * beta
-        double[] seasonal = new double[n];
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < K; j++) {
-                double angle;
-                int colIdx = j;
-                // Reconstruct Fourier features
-                int yearlyFeatures = 2 * config.yearlyFourierOrder;
-                if (colIdx < yearlyFeatures) {
-                    int harmonics = colIdx / 2 + 1;
-                    boolean isSin = colIdx % 2 == 1;
-                    angle = 2.0 * Math.PI * harmonics * futureT[i] / 365.25;
-                    seasonal[i] += beta[j] * (isSin ? Math.sin(angle) : Math.cos(angle));
-                } else {
-                    int adjCol = colIdx - yearlyFeatures;
-                    int harmonics = adjCol / 2 + 1;
-                    boolean isSin = adjCol % 2 == 1;
-                    angle = 2.0 * Math.PI * harmonics * futureT[i] / 7.0;
-                    seasonal[i] += beta[j] * (isSin ? Math.sin(angle) : Math.cos(angle));
-                }
-            }
-        }
-
-        // Compute holiday: h(t) = X_holiday * kappa
-        double[] holiday = new double[n];
-        for (int i = 0; i < n; i++) {
-            double ti = futureT[i];
-            for (int j = 0; j < H; j++) {
-                ProphetConfig.HolidaySpec hol = config.holidays.get(j);
-                double diff = ti - hol.timestamp;
-                if (diff >= -hol.windowBefore && diff <= hol.windowAfter) {
-                    double sigma = (hol.windowBefore + hol.windowAfter) / 2.0;
-                    holiday[i] += kappa[j] * Math.exp(-0.5 * diff * diff / (sigma * sigma));
-                }
-            }
-        }
-
-        // Combine: additive or multiplicative
-        double[] yhat = new double[n];
-        if (config.seasonalityMode == ProphetConfig.SeasonalityMode.ADDITIVE) {
-            for (int i = 0; i < n; i++) {
-                yhat[i] = trend[i] + seasonal[i] + holiday[i];
-            }
-        } else {
-            // Multiplicative: y = g(t) * (1 + s(t) + h(t))
-            for (int i = 0; i < n; i++) {
-                yhat[i] = trend[i] * (1 + seasonal[i] + holiday[i]);
-            }
-        }
-
-        // Uncertainty estimation (Prophet's predictive simulation)
-        double[] yhatLower = new double[n];
-        double[] yhatUpper = new double[n];
-
-        if (mcmcSamples != null && mcmcSamples.length > 0) {
-            // Prophet's default: always use predictive simulation for uncertainty
-            // MCMC samples inform the parameter uncertainty, but Prophet's
-            // predict() uses simulation-based uncertainty (not direct MCMC posterior)
-            computeUncertaintyFromSimulation(futureT, trend, yhat, yhatLower, yhatUpper);
-        } else {
-            // Prophet's default: simulate trend uncertainty + observation noise
-            computeUncertaintyFromSimulation(futureT, trend, yhat, yhatLower, yhatUpper);
-        }
-
-        // Un-scale predictions
-        for (int i = 0; i < n; i++) {
-            yhat[i] = yhat[i] * yStd + yMean;
-            yhatLower[i] = yhatLower[i] * yStd + yMean;
-            yhatUpper[i] = yhatUpper[i] * yStd + yMean;
-        }
-        // Also un-scale trend for reporting
-        double[] trendUnscaled = new double[n];
-        for (int i = 0; i < n; i++) {
-            trendUnscaled[i] = trend[i] * yStd + yMean;
-        }
-
-        return new ForecastResult(futureT, yhat, yhatLower, yhatUpper, trendUnscaled);
+        return BayesianPriors.computeTrend(sK, sM, sortedDeltas, tScaled, sortedCPs, growthCode, futureCapScaled);
     }
 
-    /**
-     * Prophet's uncertainty simulation (when MCMC is not used).
-     * Samples future changepoint rates from the Laplace prior and adds noise.
-     * This exactly follows Prophet's make_future_dataframe + predictive_samples logic.
-     *
-     * Prophet's approach: For each simulation, add a random perturbation to delta
-     * sampled from the same Laplace prior, then compute trend + observation noise.
-     */
-    private void computeUncertaintyFromSimulation(double[] futureT, double[] trend,
-            double[] yhat, double[] yhatLower, double[] yhatUpper) {
-        int n = futureT.length;
-        int S = changepoints.length;
-        int numSim = config.uncertaintySamples;
-        Random rng = new Random(0);
+    // ===================== Feature Building for Future =====================
 
-        double[][] yhatSamples = new double[numSim][n];
+    private double[][] buildFutureFeatures(double[] futureT, int N) {
+        if (X == null) return null;
 
-        // Prophet's trend uncertainty: estimate the rate of change from observed deltas,
-        // then simulate future rate changes as random walks with that variance.
-        // This is exactly how Prophet's make_historic_dataframe + predictive_samples works.
-        double deltaVar = 0;
-        for (int j = 0; j < S; j++) deltaVar += delta[j] * delta[j];
-        deltaVar = Math.max(deltaVar / S, 1e-10);
+        int K = X[0].length;
+        int Ks = XSeasonal != null ? XSeasonal[0].length : 0;
+        int Kh = XHoliday != null ? XHoliday[0].length : 0;
+        double[][] XFuture = new double[N][K];
 
-        for (int s = 0; s < numSim; s++) {
-            // Prophet's approach: for each simulation, sample future trend increments
-            // from N(0, deltaVar) — the empirical variance of observed rate changes.
-            // This gives realistic trend uncertainty that grows with forecast horizon.
-            double[] simDelta = new double[S];
-            for (int j = 0; j < S; j++) {
-                simDelta[j] = delta[j];
+        for (int i = 0; i < N; i++) {
+            double days = futureT[i];
+            int col = 0;
+
+            // Seasonal features
+            if (config.yearlySeasonality) {
+                int order = config.yearlyFourierOrder;
+                double period = config.yearlyPeriod;
+                for (int k = 1; k <= order; k++) {
+                    double arg = 2 * Math.PI * k / period;
+                    XFuture[i][col++] = Math.sin(days * arg);
+                    XFuture[i][col++] = Math.cos(days * arg);
+                }
+            }
+            if (config.weeklySeasonality) {
+                int order = config.weeklyFourierOrder;
+                double period = config.weeklyPeriod;
+                for (int k = 1; k <= order; k++) {
+                    double arg = 2 * Math.PI * k / period;
+                    XFuture[i][col++] = Math.sin(days * arg);
+                    XFuture[i][col++] = Math.cos(days * arg);
+                }
+            }
+            if (config.dailySeasonality) {
+                int order = config.dailyFourierOrder;
+                double period = config.dailyPeriod;
+                for (int k = 1; k <= order; k++) {
+                    double arg = 2 * Math.PI * k / period;
+                    XFuture[i][col++] = Math.sin(days * arg);
+                    XFuture[i][col++] = Math.cos(days * arg);
+                }
             }
 
-            for (int i = 0; i < n; i++) {
-                double ti = futureT[i];
-                double aDeltaSum = 0, aGammaSum = 0;
-                for (int j = 0; j < S; j++) {
-                    double a = ti >= changepoints[j] ? 1.0 : 0.0;
-                    aDeltaSum += a * simDelta[j];
-                    aGammaSum += a * (-changepoints[j] * simDelta[j]);
-                }
-                // Prophet's key formula for trend uncertainty:
-                // For future dates, add cumulative random walk perturbation
-                // σ_trend(t) = sqrt(T * δVar) where T is forecast horizon
-                double trendSample;
-                if (config.growth == ProphetConfig.GrowthType.LINEAR) {
-                    trendSample = (k + aDeltaSum) * ti + (m + aGammaSum);
-                    // Add trend uncertainty: Prophet uses the empirical delta variance
-                    // to simulate how much the trend could drift over the forecast horizon
-                    double maxT = trainingMaxT;
-                    if (ti > maxT) {
-                        double futureHorizon = ti - maxT;
-                        double trendUncertainty = rng.nextGaussian() * Math.sqrt(futureHorizon * deltaVar);
-                        trendSample += trendUncertainty;
-                    }
-                } else {
-                    double rate = k + aDeltaSum;
-                    double offset = m + aGammaSum;
-                    double C = (config.cap - yMean) / yStd; // standardize cap
-                    trendSample = C / (1.0 + Math.exp(-rate * (ti - offset)));
-                }
-                // Add seasonality and holiday (from MAP estimates)
-                double seasonVal = 0;
-                for (int j = 0; j < beta.length; j++) {
-                    int yearlyFeatures = 2 * config.yearlyFourierOrder;
-                    if (j < yearlyFeatures) {
-                        int harmonics = j / 2 + 1;
-                        boolean isSin = j % 2 == 1;
-                        double angle = 2.0 * Math.PI * harmonics * ti / 365.25;
-                        seasonVal += beta[j] * (isSin ? Math.sin(angle) : Math.cos(angle));
-                    } else {
-                        int adjCol = j - yearlyFeatures;
-                        int harmonics = adjCol / 2 + 1;
-                        boolean isSin = adjCol % 2 == 1;
-                        double angle = 2.0 * Math.PI * harmonics * ti / 7.0;
-                        seasonVal += beta[j] * (isSin ? Math.sin(angle) : Math.cos(angle));
+            // Holiday features
+            if (XHoliday != null) {
+                for (ProphetConfig.HolidaySpec hol : config.holidays) {
+                    int wb = hol.windowBefore;
+                    int wa = hol.windowAfter;
+                    for (int offset = -wb; offset <= wa; offset++) {
+                        double targetDay = hol.timestamp + offset;
+                        XFuture[i][col++] = Math.abs(days - targetDay) < 0.5 ? 1.0 : 0.0;
                     }
                 }
-                double holVal = 0;
-                for (int j = 0; j < kappa.length; j++) {
-                    ProphetConfig.HolidaySpec hol = config.holidays.get(j);
-                    double diff = ti - hol.timestamp;
-                    if (diff >= -hol.windowBefore && diff <= hol.windowAfter) {
-                        double sigma = (hol.windowBefore + hol.windowAfter) / 2.0;
-                        holVal += kappa[j] * Math.exp(-0.5 * diff * diff / (sigma * sigma));
-                    }
-                }
-                // Add observation noise (Prophet's sigma_obs)
-                yhatSamples[s][i] = trendSample + seasonVal + holVal + rng.nextGaussian() * sigmaObs;
             }
         }
 
-        // Compute 80% intervals from samples
-        for (int i = 0; i < n; i++) {
-            double[] vals = new double[numSim];
-            for (int s = 0; s < numSim; s++) vals[s] = yhatSamples[s][i];
-            java.util.Arrays.sort(vals);
-            yhatLower[i] = vals[(int) (0.1 * numSim)];
-            yhatUpper[i] = vals[(int) (0.9 * numSim)];
-        }
+        return XFuture;
     }
 
-    /**
-     * Uncertainty from MCMC posterior samples.
-     * Each sample defines a full set of parameters; compute yhat for each.
-     */
-    private void computeUncertaintyFromMCMC(double[] futureT, double[] yhat,
-            double[] yhatLower, double[] yhatUpper) {
-        int n = futureT.length;
-        int numSamples = mcmcSamples.length;
-        int S = changepoints.length;
-        int K = beta.length;
-        int H = kappa.length;
+    // ===================== Getters =====================
 
-        double[][] yhatSamples = new double[numSamples][n];
-        Random rng = new Random(0);
-
-        for (int s = 0; s < numSamples; s++) {
-            double[] theta = mcmcSamples[s];
-            double sk = theta[0], sm = theta[1];
-            double[] sd = new double[S];
-            System.arraycopy(theta, 2, sd, 0, S);
-            double sSigma = Math.exp(theta[2 + S]);
-            double[] sBeta = new double[K];
-            if (K > 0) System.arraycopy(theta, 3 + S, sBeta, 0, K);
-            double[] sKappa = new double[H];
-            if (H > 0) System.arraycopy(theta, 3 + S + K, sKappa, 0, H);
-
-            for (int i = 0; i < n; i++) {
-                double ti = futureT[i];
-                double aDS = 0, aGS = 0;
-                for (int j = 0; j < S; j++) {
-                    double a = ti >= changepoints[j] ? 1.0 : 0.0;
-                    aDS += a * sd[j];
-                    aGS += a * (-changepoints[j] * sd[j]);
-                }
-                double trendVal = (sk + aDS) * ti + (sm + aGS);
-                yhatSamples[s][i] = trendVal + rng.nextGaussian() * sSigma;
-            }
-        }
-
-        for (int i = 0; i < n; i++) {
-            double[] vals = new double[numSamples];
-            for (int s = 0; s < numSamples; s++) vals[s] = yhatSamples[s][i];
-            java.util.Arrays.sort(vals);
-            yhatLower[i] = vals[(int) (0.1 * numSamples)];
-            yhatUpper[i] = vals[(int) (0.9 * numSamples)];
-        }
-    }
-
-    /** Sample from Laplace distribution */
-    private double sampleLaplace(Random rng, double mu, double b) {
-        double u = rng.nextDouble() - 0.5;
-        return mu - b * Math.signum(u) * Math.log(1 - 2 * Math.abs(u));
-    }
-
-    // Getters
+    public double getSigmaObs() { return sigmaObs * yScale; }  // back to original scale
+    public double[] getDelta() { return delta; }
+    public double[] getBeta() { return beta; }
     public double getK() { return k; }
     public double getM() { return m; }
-    public double[] getDelta() { return delta; }
-    public double getSigmaObs() { return sigmaObs; }
-    public double[] getBeta() { return beta; }
-    public double[] getKappa() { return kappa; }
-    public double[] getChangepoints() { return changepoints; }
-    public boolean isFitted() { return fitted; }
-    public ComputeBackend getCompute() { return compute; }
-
-    /**
-     * Forecast result with prediction intervals.
-     */
-    public static class ForecastResult {
-        public final double[] timestamps;
-        public final double[] yhat;
-        public final double[] yhatLower;  // 10th percentile (80% CI)
-        public final double[] yhatUpper;  // 90th percentile (80% CI)
-        public final double[] trend;
-
-        public ForecastResult(double[] timestamps, double[] yhat,
-                double[] yhatLower, double[] yhatUpper, double[] trend) {
-            this.timestamps = timestamps;
-            this.yhat = yhat;
-            this.yhatLower = yhatLower;
-            this.yhatUpper = yhatUpper;
-            this.trend = trend;
-        }
-
-        public int size() { return yhat.length; }
-    }
+    public List<double[]> getPosteriorSamples() { return posteriorSamples; }
 }

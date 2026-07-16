@@ -5,23 +5,13 @@ import java.util.List;
 
 /**
  * Prophet configuration — mirrors Prophet's Python constructor parameters exactly.
- *
- * Key parameters (from facebook/prophet):
- * - growth: 'linear' or 'logistic'
- * - changepoints: custom changepoint dates (null = auto)
- * - n_changepoints: number of automatic changepoints (default 25)
- * - changepoint_range: proportion of history for changepoints (default 0.8)
- * - changepoint_prior_scale: Laplace scale tau (default 0.05)
- * - seasonality_prior_scale: Normal scale for beta (default 10)
- * - holidays_prior_scale: Normal scale for kappa (default 10)
- * - seasonality_mode: 'additive' or 'multiplicative'
- * - mcmc_samples: 0 = MAP only, >0 = MCMC samples (default 0)
- * - uncertainty_samples: number of posterior predictive samples (default 1000)
+ * Reference: facebook/prophet python/prophet/forecaster.py __init__
  */
 public class ProphetConfig {
 
-    public enum GrowthType { LINEAR, LOGISTIC }
+    public enum GrowthType { LINEAR, LOGISTIC, FLAT }
     public enum SeasonalityMode { ADDITIVE, MULTIPLICATIVE }
+    public enum Scaling { ABSMAX, MINMAX }
 
     // Growth
     public GrowthType growth = GrowthType.LINEAR;
@@ -31,43 +21,54 @@ public class ProphetConfig {
 
     // Seasonality
     public SeasonalityMode seasonalityMode = SeasonalityMode.ADDITIVE;
-    public double seasonalityPriorScale = 10.0;   // sigma_beta
+    public double seasonalityPriorScale = 10.0;   // sigma_beta for all seasonal features
+    public double yearlySeasonalityPriorScale = 10.0;
+    public double weeklySeasonalityPriorScale = 10.0;
+    public double dailySeasonalityPriorScale = 10.0;
     public int yearlyFourierOrder = 10;
     public int weeklyFourierOrder = 3;
+    public int dailyFourierOrder = 4;
     public boolean yearlySeasonality = true;
-    public boolean weeklySeasonality = true;
+    public boolean weeklySeasonality = false;
+    public boolean dailySeasonality = false;
 
     // Holidays
     public double holidaysPriorScale = 10.0;       // sigma_kappa
+    public SeasonalityMode holidaysMode = null;    // null = same as seasonalityMode
 
     // MCMC
     public int mcmcSamples = 0;                     // 0 = MAP only (Prophet default)
     public int mcmcWarmup = 500;
-    public int mcmcChains = 4;                      // parallel MCMC chains (GPU parallel)
-    public boolean useNUTS = true;                  // Use NUTS (Stan's sampler) vs MH
+    public int mcmcChains = 4;
+    public boolean useNUTS = true;
 
     // Uncertainty
-    public int uncertaintySamples = 1000;           // posterior predictive samples
-    public double sigmaObsPriorScale = 0.5;         // Half-Cauchy scale for sigma_obs
+    public int uncertaintySamples = 1000;
+    public double sigmaObsPriorScale = 0.5;         // Normal(0, scale) for sigma_obs (NOT HalfCauchy)
 
     // Optimization
     public int lbfgsMaxIter = 10000;
     public double lbfgsGradTol = 1e-8;
     public boolean verbose = true;
 
+    // Scaling
+    public Scaling scaling = Scaling.ABSMAX;        // Prophet default: 'absmax'
+
     // Logistic growth params
     public double cap = Double.MAX_VALUE;           // carrying capacity C
-    public double floor = Double.NEGATIVE_INFINITY; // saturating minimum
+    public double floor = 0.0;                      // saturating minimum (Prophet default 0)
+
+    // Annual period (365.25 to account for leap years, matching Prophet)
+    public double yearlyPeriod = 365.25;
+    public double weeklyPeriod = 7.0;
+    public double dailyPeriod = 1.0;
 
     // Holiday definitions
     public List<HolidaySpec> holidays = new ArrayList<>();
 
-    /**
-     * Holiday specification — mirrors Prophet's holidays_table format.
-     */
     public static class HolidaySpec {
         public final String name;
-        public final double timestamp;   // day number
+        public final double timestamp;
         public final int windowBefore;
         public final int windowAfter;
 
@@ -91,5 +92,10 @@ public class ProphetConfig {
     public ProphetConfig addHoliday(String name, double timestamp) {
         holidays.add(new HolidaySpec(name, timestamp));
         return this;
+    }
+
+    /** Effective holidays mode: if null, use seasonalityMode */
+    public SeasonalityMode getHolidaysMode() {
+        return holidaysMode != null ? holidaysMode : seasonalityMode;
     }
 }
