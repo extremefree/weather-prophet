@@ -181,14 +181,25 @@ public class LBFGSOptimizer {
 
             double paramChange = VecOps.norm(VecOps.subtract(x, prevX));
             if (iter > 1 && paramChange < paramTol) {
-                if (verbose) System.out.printf("[L-BFGS] Converged: |Δx|=%.2e < %.2e%n", paramChange, paramTol);
-                break;
+                if (gradNorm < 1e3 * gradTol) {
+                    if (verbose) System.out.printf("[L-BFGS] Converged: |Δx|=%.2e < %.2e%n", paramChange, paramTol);
+                    break;
+                }
+                // Reset L-BFGS history to escape stalling
+                histSize = 0;
+                histPtr = 0;
             }
 
             if (iter > 1 && Math.abs(fVal - prevVal) < funcTol * Math.abs(prevVal + 1e-10)) {
-                if (verbose) System.out.printf("[L-BFGS] Converged: |Δf|=%.2e < %.2e*|f|%n",
-                        Math.abs(fVal - prevVal), funcTol);
-                break;
+                // Only declare convergence via Δf if gradient is also reasonably small
+                if (gradNorm < 1e3 * gradTol) {
+                    if (verbose) System.out.printf("[L-BFGS] Converged: |Δf|=%.2e < %.2e*|f|%n",
+                            Math.abs(fVal - prevVal), funcTol);
+                    break;
+                }
+                // Otherwise: reset L-BFGS history to escape plateau
+                histSize = 0;
+                histPtr = 0;
             }
         }
 

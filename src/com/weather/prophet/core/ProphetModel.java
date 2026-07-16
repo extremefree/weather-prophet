@@ -199,12 +199,21 @@ public class ProphetModel {
         double initK = (x1 != x0) ? (y1 - y0) / (x1 - x0) : 0;
         double initM = y0 - initK * x0;
 
+        // Estimate initial sigma from residual of linear fit
+        double sumResid2 = 0;
+        for (int i = 0; i < T; i++) {
+            double pred = initK * trainT[i] + initM;
+            sumResid2 += (trainY[i] - pred) * (trainY[i] - pred);
+        }
+        double initSigma = Math.sqrt(sumResid2 / Math.max(T - 2, 1));
+        if (initSigma < 0.01) initSigma = 0.01;
+
         int numParams = 3 + S + K + H; // k, m, delta[S], logSigma, beta[K], kappa[H]
         double[] theta0 = new double[numParams];
         theta0[0] = initK;       // k
         theta0[1] = initM;       // m
         // delta = 0 (default)
-        theta0[2 + S] = Math.log(0.1); // log(sigma_obs) initial
+        theta0[2 + S] = Math.log(initSigma); // log(sigma_obs) initial — data-driven estimate
 
         // Step 5: L-BFGS optimization (MAP estimation)
         if (config.verbose) System.out.println("[Prophet] Optimizing via L-BFGS (MAP estimation)...");

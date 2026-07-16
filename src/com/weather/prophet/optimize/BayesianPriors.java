@@ -203,14 +203,14 @@ public class BayesianPriors {
                 dLdk += dLdYhat[i] * C * expTerm * ti / denom; // approximate
             }
         }
-        grad[0] = dLdk + gradLogNormal(k, 0, 5); // prior gradient
+        grad[0] = dLdk - gradLogNormal(k, 0, 5); // prior: -d(logPrior)/d(k)
 
         // --- Gradient w.r.t. m ---
         double dLdm = 0;
         for (int i = 0; i < T; i++) {
             dLdm += dLdYhat[i] * 1.0; // dm/dy_hat = 1 for linear trend
         }
-        grad[1] = dLdm + gradLogNormal(m, 0, 5);
+        grad[1] = dLdm - gradLogNormal(m, 0, 5);
 
         // --- Gradient w.r.t. delta[j] ---
         for (int j = 0; j < S; j++) {
@@ -225,17 +225,22 @@ public class BayesianPriors {
                     dLdDeltaJ += dLdYhat[i] * a * 0.1; // approximate for logistic
                 }
             }
-            grad[2 + j] = dLdDeltaJ + gradLogLaplace(delta[j], 0, tau);
+            grad[2 + j] = dLdDeltaJ - gradLogLaplace(delta[j], 0, tau);
         }
 
         // --- Gradient w.r.t. log(sigma_obs) ---
-        double dLdSigma = 0;
-        for (int i = 0; i < T; i++) {
-            dLdSigma += residual[i] * residual[i] / (sigma2 * sigmaObs) - 1.0 / sigmaObs;
-        }
-        double dLogSigmaDsigma = sigmaObs; // d(log sigma)/d(sigma) * d(sigma)/d(log_sigma) chain rule
-        grad[2 + S] = dLdSigma * dLogSigmaDsigma + gradLogHalfCauchy(sigmaObs, sigmaObsScale) * dLogSigmaDsigma
-                + gradLogNormal(logSigmaObs, 0, 5) * dLogSigmaDsigma;
+        // negLogLik = sum(0.5*(y-yHat)^2/sigma^2 + log(sigma) + 0.5*log(2π))
+        // d(negLogLik)/d(sigma) = -sum(residual^2/sigma^3) + T/sigma
+        // d(sigma)/d(logSigma) = sigma (chain rule)
+        // d(negLogLik)/d(logSigma) = (-sum(residual^2/sigma^2) + T)
+        double sumResid2 = 0;
+        for (int i = 0; i < T; i++) sumResid2 += residual[i] * residual[i];
+        double dNegLogLikDLogSigma = -sumResid2 / sigma2 + T;
+        // Prior gradient: -d(logPrior)/d(logSigma) = -d(logHalfCauchy)/d(sigma) * sigma
+        double dPriorDLogSigma = -gradLogHalfCauchy(sigmaObs, sigmaObsScale) * sigmaObs;
+        // Jacobian: logSigma ~ N(0,5), d(-logPrior)/d(logSigma) = -gradLogNormal(logSigma, 0, 5) * sigma
+        double dJacobDLogSigma = -gradLogNormal(logSigmaObs, 0, 5);
+        grad[2 + S] = dNegLogLikDLogSigma + dPriorDLogSigma + dJacobDLogSigma;
 
         // --- Gradient w.r.t. beta[j] ---
         for (int j = 0; j < K; j++) {
@@ -243,7 +248,7 @@ public class BayesianPriors {
             for (int i = 0; i < T; i++) {
                 dLdBetaJ += dLdYhat[i] * XSeasonal[i][j];
             }
-            grad[3 + S + j] = dLdBetaJ + gradLogNormal(beta[j], 0, sigmaBeta);
+            grad[3 + S + j] = dLdBetaJ - gradLogNormal(beta[j], 0, sigmaBeta);
         }
 
         // --- Gradient w.r.t. kappa[j] ---
@@ -252,7 +257,7 @@ public class BayesianPriors {
             for (int i = 0; i < T; i++) {
                 dLdKappaJ += dLdYhat[i] * XHoliday[i][j];
             }
-            grad[3 + S + K + j] = dLdKappaJ + gradLogNormal(kappa[j], 0, sigmaKappa);
+            grad[3 + S + K + j] = dLdKappaJ - gradLogNormal(kappa[j], 0, sigmaKappa);
         }
 
         // Pack result: first element is negLogPost, rest is gradient

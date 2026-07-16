@@ -299,6 +299,6 @@ public class MCMCSampler {
             if (direction < 0 && logAcceptProb > Math.log(0.5)) break;
         }
 
-        return Math.max(eps, 1e-6);
+        return Math.min(Math.max(eps, 1e-6), 1.0); // cap step size at 1.0 for stability
     }
 }
